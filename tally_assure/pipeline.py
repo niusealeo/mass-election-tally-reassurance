@@ -89,14 +89,40 @@ def _output_electorate_folder(output_root: Path, termKey: str, electorateFolder:
 
 
 def run_all(
-    hash_index_path: Path,
-    input_root: Path,
-    output_root: Path,
+    hash_index_path: Optional[Path] = None,
+    input_root: Optional[Path] = None,
+    output_root: Optional[Path] = None,
     electorates_by_term_path: Optional[Path] = None,
+    terms: Optional[List[str]] = None,
+    min_year: int = 2002,
+    max_year: Optional[int] = None,
+    downloaded_hash_index_path: Optional[Path] = None,
+    **kwargs: Any,
 ) -> None:
+    # Back-compat: allow old arg name downloaded_hash_index_path
+    if hash_index_path is None and downloaded_hash_index_path is not None:
+        hash_index_path = downloaded_hash_index_path
+    if hash_index_path is None:
+        raise TypeError("run_all requires hash_index_path (or downloaded_hash_index_path)")
+    if input_root is None or output_root is None:
+        raise TypeError("run_all requires input_root and output_root")
+
+    # Normalise output to include electionresults.govt.nz folder
+    if output_root.name != "electionresults.govt.nz":
+        output_root = output_root / "electionresults.govt.nz"
+
     safe_mkdir(output_root)
 
     jobs = build_jobs(hash_index_path, input_root)
+
+    # Filter by terms and years
+    if terms:
+        terms_set = set(terms)
+        jobs = [j for j in jobs if j.termKey in terms_set]
+    if min_year is not None:
+        jobs = [j for j in jobs if (j.year or 0) >= int(min_year)]
+    if max_year is not None:
+        jobs = [j for j in jobs if (j.year or 0) <= int(max_year)]
     _apply_alphabetic_numbers(jobs, electorates_by_term_path)
 
     # per-term aggregation

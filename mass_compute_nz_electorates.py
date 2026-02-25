@@ -10,8 +10,11 @@ from pathlib import Path
 
 from tally_assure.pipeline import run_all
 
-def main():
-    ap = argparse.ArgumentParser(description="Mass computation for NZ electorate split-vote reconstruction + QA checksums (modular).")
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Mass computation for NZ electorate split-vote reconstruction + QA checksums (modular)."
+    )
     ap.add_argument("--input-root", required=True)
     ap.add_argument("--output-root", required=True)
     ap.add_argument("--downloaded-hash-index", required=True)
@@ -22,14 +25,15 @@ def main():
     args = ap.parse_args()
 
     run_all(
+        hash_index_path=Path(args.downloaded_hash_index).resolve(),
         input_root=Path(args.input_root).resolve(),
         output_root=Path(args.output_root).resolve(),
-        downloaded_hash_index_path=Path(args.downloaded_hash_index).resolve(),
         terms=args.terms,
         min_year=args.min_year,
         max_year=args.max_year,
         electorates_by_term_path=(Path(args.electorates_by_term).resolve() if args.electorates_by_term else None),
     )
+
 
 if __name__ == "__main__":
     main()

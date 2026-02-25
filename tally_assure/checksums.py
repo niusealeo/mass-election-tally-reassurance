@@ -495,7 +495,7 @@ def checksum_splitvote_endstate_2002(
     cand_cols = [c for c in mat.columns if c not in ["Party"] + bookkeeping]
 
     for c in cand_cols + bookkeeping[0:3]:
-        main[c] = pd.to_numeric(main[c], errors="coerce").fillna(0.0)
+        main.loc[:, c] = pd.to_numeric(main[c], errors="coerce").fillna(0.0)
 
     # Row consistency: record failures (should match bool column but recompute here)
     row_fail = []
