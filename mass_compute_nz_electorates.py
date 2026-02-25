@@ -672,10 +672,18 @@ def checksum_electorate(job: ElectorateJob, out_dir: Path) -> Tuple[bool, bool]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input-root", required=True)
-    ap.add_argument("--output-root", required=True)
-    ap.add_argument("--downloaded-hash-index", required=True)
-    ap.add_argument("--terms", nargs="*", default=None)
+    ap.add_argument("--input-root", required=True,
+                    help="Folder that CONTAINS the domain folder (e.g. contains electionresults.govt.nz/)")
+    ap.add_argument("--output-root", required=True,
+                    help="Where to write outputs; mirrors input structure")
+    ap.add_argument("--downloaded-hash-index", required=True,
+                    help="Path to downloaded_hash_index.json")
+    ap.add_argument("--terms", nargs="*", default=None,
+                    help="Optional list of termKey(s) to process")
+    ap.add_argument("--min-year", type=int, default=2002,
+                    help="Ignore terms before this year (default: 2002)")
+    ap.add_argument("--max-year", type=int, default=None,
+                    help="Ignore terms after this year")
     args = ap.parse_args()
 
     input_root = Path(args.input_root).resolve()
@@ -685,6 +693,7 @@ def main():
     jobs = build_jobs(hash_index_path, input_root)
     if args.terms:
         jobs = [j for j in jobs if j.termKey in set(args.terms)]
+    jobs = [j for j in jobs if j.year >= args.min_year and (args.max_year is None or j.year <= args.max_year)]
 
     jobs_by_term: Dict[str, List[ElectorateJob]] = {}
     for j in jobs:
@@ -692,6 +701,7 @@ def main():
 
     top_pass_terms=[]; top_fail_terms=[]
     utc_top, local_top = now_stamps()
+    processed_electorates_total = 0
 
     for termKey, term_jobs in sorted(jobs_by_term.items(), key=lambda x: x[0]):
         term_pass=[]; term_fail=[]
@@ -708,6 +718,7 @@ def main():
             out_dir = output_root / rel_dir
 
             _, any_fail = checksum_electorate(job, out_dir)
+            processed_electorates_total += 1
 
             rec = {
                 "termKey": termKey, "year": job.year,
@@ -758,31 +769,59 @@ def main():
             except Exception as e:
                 (out_dir / f"electorate{job.electorateNumber}_finish_ERROR.txt").write_text(str(e), encoding="utf-8")
 
-        # term-level outputs
-        # term directory = output_root / relative term folder (one level above electorate folder)
+# term-level outputs (only if we processed at least one electorate in this term)
+if term_pass or term_fail:
+    # Mirror the term directory: it is the parent of the electorate folders we wrote into.
+    out_term_dir = None
+    for j in term_jobs:
+        for p in [j.split_path, j.cand_path, j.party_path]:
+            if p and p.exists():
+                elect_in_dir = p.parent
+                elect_out_dir = output_root / rel_from_input(input_root, elect_in_dir)
+                out_term_dir = elect_out_dir.parent
+                break
+        if out_term_dir is not None:
+            break
+    if out_term_dir is None:
         out_term_dir = output_root / termKey
-        safe_mkdir(out_term_dir)
-        utc_s, local_s = now_stamps()
-        stamp = utc_s.replace(":","").replace("-","")
-        if term_pass:
-            pd.DataFrame(term_pass).to_csv(out_term_dir / f"term_checksum_pass_{stamp}.csv", index=False, encoding="utf-8")
-        if term_fail:
-            pd.DataFrame(term_fail).to_csv(out_term_dir / f"term_checksum_fail_{stamp}.csv", index=False, encoding="utf-8")
 
-        if not term_fail:
-            top_pass_terms.append({"termKey": termKey, "status":"PASS", "written_utc": utc_s, "written_local": local_s})
-        else:
-            top_fail_terms.append({"termKey": termKey, "status":"FAIL", "written_utc": utc_s, "written_local": local_s})
-
-    safe_mkdir(output_root)
+    safe_mkdir(out_term_dir)
     utc_s, local_s = now_stamps()
     stamp = utc_s.replace(":","").replace("-","")
+    if term_pass:
+        pd.DataFrame(term_pass).to_csv(out_term_dir / f"term_checksum_pass_{stamp}.csv", index=False, encoding="utf-8")
+    if term_fail:
+        pd.DataFrame(term_fail).to_csv(out_term_dir / f"term_checksum_fail_{stamp}.csv", index=False, encoding="utf-8")
+
+    if not term_fail:
+        top_pass_terms.append({"termKey": termKey, "status":"PASS", "written_utc": utc_s, "written_local": local_s})
+    else:
+        top_fail_terms.append({"termKey": termKey, "status":"FAIL", "written_utc": utc_s, "written_local": local_s})
+
+safe_mkdir(output_root)
+utc_s, local_s = now_stamps()
+stamp = utc_s.replace(":","").replace("-","")
+
+if processed_electorates_total == 0:
+    (output_root / f"NO_ELECTORATES_PROCESSED_{stamp}.txt").write_text(
+        "No electorates were processed.\n\n"
+        "Most likely causes:\n"
+        "1) --input-root does not match the prefix of saved_to paths in downloaded_hash_index.json\n"
+        "2) The downloaded_hash_index.json points at a different crawl/layout than your local downloads folder\n"
+        "3) Files referenced in saved_to are missing on disk\n\n"
+        "Quick check:\n"
+        "- Open downloaded_hash_index.json\n"
+        "- Copy one 'saved_to' value\n"
+        "- Verify this exists: (input_root / saved_to)\n",
+        encoding="utf-8"
+    )
+else:
     if top_pass_terms:
         pd.DataFrame(top_pass_terms).to_csv(output_root / f"elections_checksum_pass_{stamp}.csv", index=False, encoding="utf-8")
     if top_fail_terms:
         pd.DataFrame(top_fail_terms).to_csv(output_root / f"elections_checksum_fail_{stamp}.csv", index=False, encoding="utf-8")
 
-    print("Done.")
+print("Done.")
 
 
 if __name__ == "__main__":
