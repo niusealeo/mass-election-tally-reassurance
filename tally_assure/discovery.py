@@ -13,6 +13,7 @@ class ElectorateJob:
     electorateFolder: str
     electorateNumber: Optional[int]
     electorateName: Optional[str]
+    alphabeticNumber: Optional[str]
     split_path: Optional[Path]
     cand_path: Optional[Path]
     party_path: Optional[Path]
@@ -61,7 +62,6 @@ def build_jobs(hash_index_path: Path, input_root: Path) -> List[ElectorateJob]:
             elif "party" in fn:
                 party_path = abs_p
 
-        jobs.append(ElectorateJob(termKey, year, ef, num, name, split_path, cand_path, party_path))
+        jobs.append(ElectorateJob(termKey, year, ef, num, name, None, split_path, cand_path, party_path))
 
     return jobs
-

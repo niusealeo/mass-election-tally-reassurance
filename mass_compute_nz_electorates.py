@@ -15,6 +15,7 @@ def main():
     ap.add_argument("--input-root", required=True)
     ap.add_argument("--output-root", required=True)
     ap.add_argument("--downloaded-hash-index", required=True)
+    ap.add_argument("--electorates-by-term", default=None, help="Path to electorates_by_term.json (for alphabeticNumber)")
     ap.add_argument("--terms", nargs="*", default=None)
     ap.add_argument("--min-year", type=int, default=2002)
     ap.add_argument("--max-year", type=int, default=None)
@@ -24,6 +25,7 @@ def main():
         input_root=Path(args.input_root).resolve(),
         output_root=Path(args.output_root).resolve(),
         downloaded_hash_index_path=Path(args.downloaded_hash_index).resolve(),
+        electorates_by_term_path=(Path(args.electorates_by_term).resolve() if args.electorates_by_term else None),
         terms=args.terms,
         min_year=args.min_year,
         max_year=args.max_year,
