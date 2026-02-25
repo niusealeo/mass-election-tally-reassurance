@@ -5,4 +5,6 @@ if [ ! -d ".venv" ]; then
   exit 1
 fi
 source .venv/bin/activate
-python mass_compute_nz_electorates.py "$@"
+
+# # edit depending whichversion of python, python3, etc. you have installed
+python3 mass_compute_nz_electorates.py "$@"

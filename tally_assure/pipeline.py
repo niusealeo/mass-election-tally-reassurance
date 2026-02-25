@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from .checksums import (
-    now_stamps, safe_mkdir,
+    now_stamps, safe_mkdir, read_csv_robust,
     find_totals_row, sum_excluding_totals, compare_series
 )
 from .discovery import ElectorateJob, build_jobs
@@ -34,7 +34,7 @@ def checksum_electorate(job: ElectorateJob, out_dir: Path) -> Tuple[bool, bool]:
     cand_totals_computed = pd.Series(dtype=float)
 
     if job.cand_path and job.cand_path.exists():
-        df = pd.read_csv(job.cand_path)
+        df = read_csv_robust(job.cand_path)
         trow = find_totals_row(df)
         cand_totals_computed = sum_excluding_totals(df, trow)
         if trow is not None:
@@ -50,7 +50,7 @@ def checksum_electorate(job: ElectorateJob, out_dir: Path) -> Tuple[bool, bool]:
     party_totals_computed = pd.Series(dtype=float)
 
     if job.party_path and job.party_path.exists():
-        dfp = pd.read_csv(job.party_path)
+        dfp = read_csv_robust(job.party_path)
         trowp = find_totals_row(dfp)
         party_totals_computed = sum_excluding_totals(dfp, trowp)
         if trowp is not None:
@@ -65,7 +65,7 @@ def checksum_electorate(job: ElectorateJob, out_dir: Path) -> Tuple[bool, bool]:
     split_pass_cols=[]; split_fail_cols=[]
     if job.split_path and job.split_path.exists() and len(party_totals_computed.index) > 0:
         if job.split_path.suffix.lower() == ".csv":
-            s = pd.read_csv(job.split_path)
+            s = read_csv_robust(job.split_path)
             if "Total Party Votes" in s.columns:
                 party_col = s.columns[0]
                 split_party_totals = s.set_index(party_col)["Total Party Votes"]
@@ -157,6 +157,9 @@ def run_all(
 
         for job in sorted(term_jobs, key=lambda j: (j.electorateNumber or 0, j.electorateFolder)):
             in_dir = None
+            
+            print([job.split_path, job.cand_path, job.party_path])
+            
             for p in [job.split_path, job.cand_path, job.party_path]:
                 if p and p.exists():
                     in_dir = p.parent
@@ -198,11 +201,11 @@ def run_all(
                     cand_totals = pd.Series(dtype=float)
                     party_totals = pd.Series(dtype=float)
                     if job.cand_path and job.cand_path.exists():
-                        dfc = pd.read_csv(job.cand_path)
+                        dfc = read_csv_robust(job.cand_path)
                         trow = find_totals_row(dfc)
                         cand_totals = sum_excluding_totals(dfc, trow)
                     if job.party_path and job.party_path.exists():
-                        dfp = pd.read_csv(job.party_path)
+                        dfp = read_csv_robust(job.party_path)
                         trowp = find_totals_row(dfp)
                         party_totals = sum_excluding_totals(dfp, trowp)
 
