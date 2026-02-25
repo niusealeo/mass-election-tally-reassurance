@@ -2,13 +2,62 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import pandas as pd
 
 from .checksums import safe_mkdir
 
+
+def port_xls_all_sheets(xls_path: Path, out_dir: Path, prefix: Optional[str] = None) -> List[Path]:
+    '''
+    Dump every sheet of an .xls/.xlsx workbook to CSV for inspection/QA.
+
+    - Writes header-less CSV (header=None) so it preserves raw layout.
+    - Returns list of written CSV paths.
+    '''
+    safe_mkdir(out_dir)
+    suffix = xls_path.suffix.lower()
+    base = prefix or xls_path.stem
+    outs: List[Path] = []
+
+    if suffix == ".xlsx":
+        # pandas can enumerate sheets for xlsx
+        xls = pd.ExcelFile(xls_path)
+        for i, sheet in enumerate(xls.sheet_names):
+            df = pd.read_excel(xls, sheet_name=sheet, header=None)
+            out_csv = out_dir / f"{base}_sheet{i}.csv"
+            df.to_csv(out_csv, index=False, header=False, encoding="utf-8")
+            outs.append(out_csv)
+        return outs
+
+    if suffix != ".xls":
+        raise ValueError("Expected .xls or .xlsx")
+
+    try:
+        import xlrd  # type: ignore
+    except Exception as e:
+        raise RuntimeError("xlrd is required to read .xls files. Install xlrd==1.2.0.") from e
+
+    book = xlrd.open_workbook(str(xls_path))
+    for i in range(book.nsheets):
+        sh = book.sheet_by_index(i)
+        rows = [[sh.cell_value(r, c) for c in range(sh.ncols)] for r in range(sh.nrows)]
+        df = pd.DataFrame(rows)
+        out_csv = out_dir / f"{base}_sheet{i}.csv"
+        df.to_csv(out_csv, index=False, header=False, encoding="utf-8")
+        outs.append(out_csv)
+    return outs
+
+
 def port_2002_xls_to_split_csv(xls_path: Path, out_csv: Path) -> None:
+    '''
+    Convert the 2002-era split-vote workbook to the *modern* split-votes CSV layout:
+    - first column = party name
+    - "Total Party Votes" column
+    - candidate percentage columns (as floats)
+    - "Total %" checksum column
+    '''
     safe_mkdir(out_csv.parent)
     suffix = xls_path.suffix.lower()
 
@@ -80,9 +129,11 @@ def port_2002_xls_to_split_csv(xls_path: Path, out_csv: Path) -> None:
     out[party_col] = df[party_col].astype(str)
     out["Total Party Votes"] = pd.to_numeric(df[tcol], errors="coerce").fillna(0).astype(float)
 
+    cleaned = []
     for c in pct_cols:
-        out[clean_pct_name(c)] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype(float)
+        name = clean_pct_name(c)
+        cleaned.append(name)
+        out[name] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype(float)
 
-    out["Total %"] = out[[clean_pct_name(c) for c in pct_cols]].sum(axis=1)
+    out["Total %"] = out[cleaned].sum(axis=1)
     out.to_csv(out_csv, index=False, encoding="utf-8")
-

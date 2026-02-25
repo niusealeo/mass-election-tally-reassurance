@@ -12,7 +12,7 @@ from .checksums import (
     checksum_candidate_atomic_detailed, checksum_party_atomic_detailed,
     port_candidate_roster_csv, port_party_roster_csv,
 )
-from .porting import port_2002_xls_to_split_csv
+from .porting import port_xls_all_sheets
 
 ANCHOR_DIRNAME = "electionresults.govt.nz"
 
@@ -151,7 +151,7 @@ def run_term(
         # Split-vote XLS -> CSV tables (2002 era)
         if job.split_path and job.split_path.exists() and job.split_path.suffix.lower() == ".xls":
             try:
-                outs = port_2002_xls_to_split_csv(job.split_path, out_dir, prefix=f"{elect_tag}_split_votes")
+                outs = port_xls_all_sheets(job.split_path, out_dir, prefix=f"{elect_tag}_split_votes")
                 pass_obj["ports"]["split_xls_to_csv"] = [p.name for p in outs]
                 any_pass = True
             except Exception as e:
@@ -183,6 +183,9 @@ def run_all(
 ) -> None:
     alpha_map = _load_alphabetic_numbers(electorates_by_term_path)
 
+    anchor_out = output_root / ANCHOR_DIRNAME
+    safe_mkdir(anchor_out)
+
     jobs = build_jobs(downloaded_hash_index_path, input_root)
 
     # Inject alphabeticNumber onto jobs
@@ -205,7 +208,7 @@ def run_all(
         term_pass, term_fail, processed = run_term(termKey, term_jobs, input_root, output_root)
         processed_electorates_total += processed
 
-        term_out_dir = output_root / termKey
+        term_out_dir = anchor_out / termKey
         safe_mkdir(term_out_dir)
 
         utc_s, local_s = now_stamps()
@@ -221,12 +224,12 @@ def run_all(
         else:
             top_fail_terms.append({"termKey": termKey, "status": "FAIL", "written_utc": utc_s, "written_local": local_s})
 
-    safe_mkdir(output_root)
+    safe_mkdir(anchor_out)
     utc_s, local_s = now_stamps()
     stamp = utc_s.replace(":","").replace("-","")
 
     if processed_electorates_total == 0:
-        write_json(output_root / f"NO_ELECTORATES_PROCESSED_{stamp}.json", {
+        write_json(anchor_out / f"NO_ELECTORATES_PROCESSED_{stamp}.json", {
             "written_utc": utc_s,
             "written_local": local_s,
             "error": "No electorates were processed.",
@@ -234,6 +237,6 @@ def run_all(
         return
 
     if top_pass_terms:
-        write_json(output_root / f"elections_checksum_pass_{stamp}.json", {"written_utc": utc_s, "written_local": local_s, "terms": top_pass_terms})
+        write_json(anchor_out / f"elections_checksum_pass_{stamp}.json", {"written_utc": utc_s, "written_local": local_s, "terms": top_pass_terms})
     if top_fail_terms:
-        write_json(output_root / f"elections_checksum_fail_{stamp}.json", {"written_utc": utc_s, "written_local": local_s, "terms": top_fail_terms})
+        write_json(anchor_out / f"elections_checksum_fail_{stamp}.json", {"written_utc": utc_s, "written_local": local_s, "terms": top_fail_terms})
