@@ -237,3 +237,15 @@ Or use a year window:
 ```bash
 ./run.sh --input-root ... --output-root ... --downloaded-hash-index ... --min-year 2017
 ```
+
+
+## Modular structure
+
+Core logic is split into modules under `tally_assure/`:
+
+- `discovery.py` — locate inputs and build electorate jobs
+- `checksums.py` — checksum functions and timestamps
+- `sainte_lague.py` — Sainte-Laguë reconstruction
+- `sliding_puzzle.py` — solver
+- `porting.py` — 2002 XLS→CSV porting
+- `pipeline.py` — orchestration
