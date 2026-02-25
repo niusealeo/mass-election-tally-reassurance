@@ -1,242 +1,212 @@
 from __future__ import annotations
 
 import json
-import os
+import re
+from dataclasses import asdict
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
-from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 
-from .discovery import ElectorateJob, build_jobs
 from .checksums import (
-    now_stamps, safe_mkdir, write_json,
-    checksum_candidate_atomic_detailed, checksum_party_atomic_detailed,
-    port_candidate_roster_csv, port_party_roster_csv,
+    now_stamps,
+    safe_mkdir,
+    write_json,
+    checksum_candidate_atomic_detailed,
+    checksum_party_atomic_detailed,
+    checksum_splitvote_endstate_2002,
+    _read_atomic_party_totals,
 )
-from .porting import port_xls_all_sheets
+from .discovery import ElectorateJob, build_jobs
+from .porting import process_2002_split_xls_to_endstate
 
-ANCHOR_DIRNAME = "electionresults.govt.nz"
+
+def _closest_common_ancestor(a: Path, b: Path) -> Path:
+    a = a.resolve()
+    b = b.resolve()
+    ap = a.parts
+    bp = b.parts
+    n = min(len(ap), len(bp))
+    i = 0
+    while i < n and ap[i] == bp[i]:
+        i += 1
+    if i == 0:
+        return Path(a.anchor)
+    return Path(*ap[:i])
 
 
-def rel_from_anchor_or_input(input_root: Path, abs_path: Path) -> Path:
-    parts = list(abs_path.parts)
-    if ANCHOR_DIRNAME in parts:
-        i = parts.index(ANCHOR_DIRNAME)
-        return Path(*parts[i:])
+def _relpath_from_common_ancestor(input_file: Path, output_file: Path) -> str:
+    anc = _closest_common_ancestor(input_file, output_file.parent)
     try:
-        return abs_path.relative_to(input_root)
-    except ValueError:
-        return abs_path
-
-
-def input_path_relative_to_output_dir(out_dir: Path, in_file: Path) -> str:
-    # relative path from the output directory to the input file, using the OS common ancestor implicitly
-    try:
-        return os.path.relpath(str(in_file), start=str(out_dir))
+        return str(input_file.resolve().relative_to(anc))
     except Exception:
-        return str(in_file)
+        return str(input_file)
 
 
-def _load_alphabetic_numbers(electorates_by_term_path: Optional[Path]) -> Dict[tuple, str]:
-    if electorates_by_term_path is None or not electorates_by_term_path.exists():
-        return {}
-    try:
-        obj = json.loads(electorates_by_term_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+def _load_alphabetic_numbers(electorates_by_term_path: Path) -> Dict[str, Dict[str, int]]:
+    """Return mapping: termKey -> normalised electorateName -> alphabeticNumber."""
+    raw = json.loads(electorates_by_term_path.read_text(encoding="utf-8"))
+    out: Dict[str, Dict[str, int]] = {}
 
-    mapping: Dict[tuple, str] = {}
+    def norm_name(s: str) -> str:
+        return re.sub(r"\s+", " ", str(s).strip()).casefold()
 
-    if isinstance(obj, dict):
-        for termKey, items in obj.items():
-            if isinstance(items, dict):
-                items = items.get("electorates") or items.get("items") or []
-            if not isinstance(items, list):
-                continue
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                ef = it.get("electorateFolder") or it.get("folder") or it.get("electorate_folder")
-                alpha = it.get("alphabeticNumber") or it.get("alphabetic_number") or it.get("alphaNumber") or it.get("alphabetic")
-                if ef and alpha is not None:
-                    mapping[(str(termKey), str(ef))] = str(alpha)
-    return mapping
+    for termKey, payload in raw.items():
+        alpha = payload.get("alphabetical_order") or {}
+        out[termKey] = {norm_name(k): int(v) for k, v in alpha.items()}
+    return out
 
 
-def run_term(
-    termKey: str,
-    term_jobs: List[ElectorateJob],
-    input_root: Path,
-    output_root: Path,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
-    term_pass: List[Dict[str, Any]] = []
-    term_fail: List[Dict[str, Any]] = []
-    processed = 0
+def _apply_alphabetic_numbers(jobs: List[ElectorateJob], electorates_by_term_path: Optional[Path]) -> None:
+    if not electorates_by_term_path or not electorates_by_term_path.exists():
+        return
+    mapping = _load_alphabetic_numbers(electorates_by_term_path)
 
-    for job in sorted(term_jobs, key=lambda j: (j.electorateNumber or 0, j.electorateFolder)):
-        in_dir = None
-        for p in [job.split_path, job.cand_path, job.party_path]:
-            if p and p.exists():
-                in_dir = p.parent
-                break
-        if in_dir is None:
+    def norm_name(s: str) -> str:
+        return re.sub(r"\s+", " ", str(s).strip()).casefold()
+
+    for j in jobs:
+        if j.termKey not in mapping:
             continue
+        if not j.electorateName:
+            continue
+        j.alphabeticNumber = mapping[j.termKey].get(norm_name(j.electorateName))
 
-        rel_dir = rel_from_anchor_or_input(input_root, in_dir)
-        out_dir = output_root / rel_dir
-        safe_mkdir(out_dir)
 
-        utc_s, local_s = now_stamps()
-        stamp = utc_s.replace(":","").replace("-","")
-        elect_num = job.electorateNumber or 0
-        elect_tag = f"electorate{elect_num}"
+def _term_folder_from_job(job: ElectorateJob, input_root: Path) -> Path:
+    # input_root is expected to include electionresults.govt.nz; term folders are under it.
+    return input_root / job.termKey
 
-        processed += 1
 
-        election_meta = {
-            "termKey": job.termKey,
-            "year": job.year,
-            "electorateNumber": job.electorateNumber,
-            "alphabeticNumber": job.alphabeticNumber,
-            "electorateName": job.electorateName,
-            "written_utc": utc_s,
-            "written_local": local_s,
-        }
+def _electorate_folder_from_job(job: ElectorateJob, input_root: Path) -> Path:
+    return _term_folder_from_job(job, input_root) / job.electorateFolder
 
-        pass_obj: Dict[str, Any] = {**election_meta, "status": "PASS", "candidate": {}, "party": {}, "ports": {}}
-        fail_obj: Dict[str, Any] = {**election_meta, "status": "FAIL", "candidate": {}, "party": {}, "ports": {}}
 
-        any_fail = False
-        any_pass = False
+def _output_term_folder(output_root: Path, termKey: str) -> Path:
+    return output_root / termKey
 
-        if job.cand_path and job.cand_path.exists():
-            cand = checksum_candidate_atomic_detailed(job.cand_path)
-            cand["file"] = input_path_relative_to_output_dir(out_dir, job.cand_path)
-            cand_has_fail = any(len(v["failed"]) > 0 for v in cand["checks"].values())
-            cand_has_pass = any(len(v["passed"]) > 0 for v in cand["checks"].values())
-            if cand_has_pass:
-                any_pass = True
-                pass_obj["candidate"] = cand
-            if cand_has_fail:
-                any_fail = True
-                fail_obj["candidate"] = cand
-            try:
-                port_candidate_roster_csv(job.cand_path, out_dir / f"{elect_tag}_candidate_roster.csv")
-            except Exception as e:
-                any_fail = True
-                fail_obj.setdefault("errors", []).append({"port_candidate_roster_csv": str(e)})
-        else:
-            any_fail = True
-            fail_obj["candidate"] = {"errors": [{"file_missing": "candidate_csv"}]}
 
-        if job.party_path and job.party_path.exists():
-            party = checksum_party_atomic_detailed(job.party_path)
-            party["file"] = input_path_relative_to_output_dir(out_dir, job.party_path)
-            party_has_fail = any(len(v["failed"]) > 0 for v in party["checks"].values())
-            party_has_pass = any(len(v["passed"]) > 0 for v in party["checks"].values())
-            if party_has_pass:
-                any_pass = True
-                pass_obj["party"] = party
-            if party_has_fail:
-                any_fail = True
-                fail_obj["party"] = party
-            try:
-                port_party_roster_csv(job.party_path, out_dir / f"{elect_tag}_party_roster.csv")
-            except Exception as e:
-                any_fail = True
-                fail_obj.setdefault("errors", []).append({"port_party_roster_csv": str(e)})
-        else:
-            any_fail = True
-            fail_obj["party"] = {"errors": [{"file_missing": "party_csv"}]}
-
-        # Split-vote XLS -> CSV tables (2002 era)
-        if job.split_path and job.split_path.exists() and job.split_path.suffix.lower() == ".xls":
-            try:
-                outs = port_xls_all_sheets(job.split_path, out_dir, prefix=f"{elect_tag}_split_votes")
-                pass_obj["ports"]["split_xls_to_csv"] = [p.name for p in outs]
-                any_pass = True
-            except Exception as e:
-                any_fail = True
-                fail_obj["ports"]["split_xls_to_csv_error"] = str(e)
-
-        if any_pass:
-            write_json(out_dir / f"{elect_tag}_checksum_pass_{stamp}.json", pass_obj)
-        if any_fail:
-            write_json(out_dir / f"{elect_tag}_checksum_fail_{stamp}.json", fail_obj)
-
-        rec = {**election_meta, "status": "FAIL" if any_fail else "PASS"}
-        if any_fail:
-            term_fail.append(rec)
-        else:
-            term_pass.append(rec)
-
-    return term_pass, term_fail, processed
+def _output_electorate_folder(output_root: Path, termKey: str, electorateFolder: str) -> Path:
+    return output_root / termKey / electorateFolder
 
 
 def run_all(
+    hash_index_path: Path,
     input_root: Path,
     output_root: Path,
-    downloaded_hash_index_path: Path,
-    terms: Optional[List[str]] = None,
-    min_year: int = 2002,
-    max_year: Optional[int] = None,
     electorates_by_term_path: Optional[Path] = None,
 ) -> None:
-    alpha_map = _load_alphabetic_numbers(electorates_by_term_path)
+    safe_mkdir(output_root)
 
-    anchor_out = output_root / ANCHOR_DIRNAME
-    safe_mkdir(anchor_out)
+    jobs = build_jobs(hash_index_path, input_root)
+    _apply_alphabetic_numbers(jobs, electorates_by_term_path)
 
-    jobs = build_jobs(downloaded_hash_index_path, input_root)
+    # per-term aggregation
+    term_pass: Dict[str, List[dict]] = {}
+    term_fail: Dict[str, List[dict]] = {}
 
-    # Inject alphabeticNumber onto jobs
-    for j in jobs:
-        j.alphabeticNumber = alpha_map.get((str(j.termKey), str(j.electorateFolder)))
-
-    if terms:
-        jobs = [j for j in jobs if j.termKey in set(terms)]
-    jobs = [j for j in jobs if j.year >= min_year and (max_year is None or j.year <= max_year)]
-
-    jobs_by_term: Dict[str, List[ElectorateJob]] = defaultdict(list)
-    for j in jobs:
-        jobs_by_term[str(j.termKey)].append(j)
-
-    top_pass_terms: List[Dict[str, Any]] = []
-    top_fail_terms: List[Dict[str, Any]] = []
-    processed_electorates_total = 0
-
-    for termKey, term_jobs in sorted(jobs_by_term.items(), key=lambda x: x[0]):
-        term_pass, term_fail, processed = run_term(termKey, term_jobs, input_root, output_root)
-        processed_electorates_total += processed
-
-        term_out_dir = anchor_out / termKey
-        safe_mkdir(term_out_dir)
+    for job in sorted(jobs, key=lambda x: (x.termKey, int(x.alphabeticNumber or 10**9), x.electorateFolder)):
+        termKey = job.termKey
+        out_term = _output_term_folder(output_root, termKey)
+        out_elec = _output_electorate_folder(output_root, termKey, job.electorateFolder)
+        safe_mkdir(out_elec)
 
         utc_s, local_s = now_stamps()
-        stamp = utc_s.replace(":","").replace("-","")
 
-        if term_pass:
-            write_json(term_out_dir / f"term_checksum_pass_{stamp}.json", {"termKey": termKey, "written_utc": utc_s, "written_local": local_s, "electorates": term_pass})
-        if term_fail:
-            write_json(term_out_dir / f"term_checksum_fail_{stamp}.json", {"termKey": termKey, "written_utc": utc_s, "written_local": local_s, "electorates": term_fail})
+        # Atomic checksums + rosters
+        cand_detail = None
+        party_detail = None
+        if job.cand_path and job.cand_path.exists():
+            cand_detail = checksum_candidate_atomic_detailed(job.cand_path)
+        if job.party_path and job.party_path.exists():
+            party_detail = checksum_party_atomic_detailed(job.party_path)
 
-        if not term_fail:
-            top_pass_terms.append({"termKey": termKey, "status": "PASS", "written_utc": utc_s, "written_local": local_s})
+        # Determine if atomic checks are clean
+        def has_fail(detail: Optional[dict]) -> bool:
+            if not detail or "checks" not in detail:
+                return True
+            for group in detail["checks"].values():
+                if isinstance(group, dict) and group.get("failed"):
+                    if len(group["failed"]) > 0:
+                        return True
+            return False
+
+        atomic_ok = (not has_fail(cand_detail)) and (not has_fail(party_detail))
+
+        # 2002 endstate processing (xls/xlsx split)
+        split_endstate_path = None
+        split_detail = None
+        if job.year == 2002 and job.split_path and job.split_path.exists() and job.party_path and job.party_path.exists():
+            split_endstate_path = out_elec / f"{job.electorateFolder}_split_votes_endstate.csv"
+            atomic_party_totals = _read_atomic_party_totals(job.party_path)
+            process_2002_split_xls_to_endstate(job.split_path, atomic_party_totals, split_endstate_path)
+            split_detail = checksum_splitvote_endstate_2002(split_endstate_path, job.cand_path, job.party_path)
+
+        # Write per-electorate checksum jsons
+        elec_meta = {
+            "termKey": termKey,
+            "year": job.year,
+            "electorateFolder": job.electorateFolder,
+            "electorateNumber": job.electorateNumber,
+            "electorateName": job.electorateName,
+            "alphabeticNumber": job.alphabeticNumber,
+            "timestamps": {"utc": utc_s, "local": local_s},
+            "paths": {
+                "split": _relpath_from_common_ancestor(job.split_path, out_elec) if job.split_path else None,
+                "candidate": _relpath_from_common_ancestor(job.cand_path, out_elec) if job.cand_path else None,
+                "party": _relpath_from_common_ancestor(job.party_path, out_elec) if job.party_path else None,
+            },
+        }
+
+        pass_payload = {**elec_meta, "candidate": cand_detail, "party": party_detail, "splitvote": split_detail}
+        fail_payload = {**elec_meta, "candidate": cand_detail, "party": party_detail, "splitvote": split_detail}
+
+        # splitvote ok?
+        split_ok = True
+        if split_detail and "checks" in split_detail:
+            for group in split_detail["checks"].values():
+                if isinstance(group, dict) and group.get("failed"):
+                    if len(group["failed"]) > 0:
+                        split_ok = False
+
+        all_ok = atomic_ok and split_ok
+
+        if all_ok:
+            out_pass = out_elec / f"{job.electorateFolder}_checksum_pass_{utc_s.replace(':','').replace('-','')}.json"
+            write_json(out_pass, pass_payload)
+            term_pass.setdefault(termKey, []).append({"electorateFolder": job.electorateFolder, "alphabeticNumber": job.alphabeticNumber})
         else:
-            top_fail_terms.append({"termKey": termKey, "status": "FAIL", "written_utc": utc_s, "written_local": local_s})
+            out_fail = out_elec / f"{job.electorateFolder}_checksum_fail_{utc_s.replace(':','').replace('-','')}.json"
+            write_json(out_fail, fail_payload)
+            term_fail.setdefault(termKey, []).append({"electorateFolder": job.electorateFolder, "alphabeticNumber": job.alphabeticNumber})
 
-    safe_mkdir(anchor_out)
+    # per-term summary
+    for termKey in sorted(set(list(term_pass.keys()) + list(term_fail.keys()))):
+        utc_s, local_s = now_stamps()
+        out_term = _output_term_folder(output_root, termKey)
+        safe_mkdir(out_term)
+
+        if term_pass.get(termKey):
+            write_json(out_term / f"term_checksum_pass_{utc_s.replace(':','').replace('-','')}.json", {
+                "termKey": termKey,
+                "timestamps": {"utc": utc_s, "local": local_s},
+                "passed_electorates": sorted(term_pass.get(termKey, []), key=lambda x: int(x.get("alphabeticNumber") or 10**9)),
+            })
+        if term_fail.get(termKey):
+            write_json(out_term / f"term_checksum_fail_{utc_s.replace(':','').replace('-','')}.json", {
+                "termKey": termKey,
+                "timestamps": {"utc": utc_s, "local": local_s},
+                "failed_electorates": sorted(term_fail.get(termKey, []), key=lambda x: int(x.get("alphabeticNumber") or 10**9)),
+            })
+
+    # elections summary (in electionresults.govt.nz folder = output_root)
     utc_s, local_s = now_stamps()
-    stamp = utc_s.replace(":","").replace("-","")
-
-    if processed_electorates_total == 0:
-        write_json(anchor_out / f"NO_ELECTORATES_PROCESSED_{stamp}.json", {
-            "written_utc": utc_s,
-            "written_local": local_s,
-            "error": "No electorates were processed.",
+    if term_fail:
+        write_json(output_root / f"elections_checksum_fail_{utc_s.replace(':','').replace('-','')}.json", {
+            "timestamps": {"utc": utc_s, "local": local_s},
+            "failed_terms": sorted(term_fail.keys()),
         })
-        return
-
-    if top_pass_terms:
-        write_json(anchor_out / f"elections_checksum_pass_{stamp}.json", {"written_utc": utc_s, "written_local": local_s, "terms": top_pass_terms})
-    if top_fail_terms:
-        write_json(anchor_out / f"elections_checksum_fail_{stamp}.json", {"written_utc": utc_s, "written_local": local_s, "terms": top_fail_terms})
+    if term_pass:
+        # pass means "terms that had at least one pass"; not necessarily 100% term
+        write_json(output_root / f"elections_checksum_pass_{utc_s.replace(':','').replace('-','')}.json", {
+            "timestamps": {"utc": utc_s, "local": local_s},
+            "terms_with_any_pass": sorted(term_pass.keys()),
+        })

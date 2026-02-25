@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
+
+
+Number = Union[int, float]
 
 
 def now_stamps() -> Tuple[str, str]:
@@ -20,11 +23,23 @@ def safe_mkdir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
+def _json_coerce_numbers(x: Any) -> Any:
+    """Convert floats that are mathematically integers into int, recursively."""
+    if isinstance(x, float):
+        if x.is_integer():
+            return int(x)
+        return x
+    if isinstance(x, dict):
+        return {k: _json_coerce_numbers(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_json_coerce_numbers(v) for v in x]
+    return x
+
+
 def write_json(path: Path, obj: Any) -> None:
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    obj2 = _json_coerce_numbers(obj)
+    path.write_text(json.dumps(obj2, ensure_ascii=False, indent=2), encoding="utf-8")
 
-
-# ---------------- robust parsing ----------------
 
 def _decode_best_effort(raw: bytes) -> str:
     for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
@@ -43,10 +58,7 @@ def read_csv_robust(path: Path) -> pd.DataFrame:
 
 
 def read_csv_atomic(path: Path) -> pd.DataFrame:
-    '''
-    Part VIII atomic files can include a small metadata preamble. We try skipping 0..5 lines
-    and keep the best-looking parse (heuristic score).
-    '''
+    """Try skipping a small metadata preamble and choose the best parse."""
     raw = path.read_bytes()
     text = _decode_best_effort(raw)
     lines = text.splitlines(True)
@@ -75,8 +87,6 @@ def read_csv_atomic(path: Path) -> pd.DataFrame:
     return best_df if best_df is not None else read_csv_robust(path)
 
 
-# ---------------- helpers ----------------
-
 def _to_num(s: pd.Series) -> pd.Series:
     if s.dtype == object:
         s2 = s.astype(str).str.replace(",", "", regex=False).str.strip()
@@ -86,9 +96,7 @@ def _to_num(s: pd.Series) -> pd.Series:
 
 
 def location_pair(df: pd.DataFrame, i: int) -> List[str]:
-    '''
-    A size-2 array from the first two columns. No row index.
-    '''
+    """A size-2 array from the first two columns. No row index."""
     v0 = df.iloc[i, 0] if df.shape[1] >= 1 else ""
     v1 = df.iloc[i, 1] if df.shape[1] >= 2 else ""
     return [
@@ -138,7 +146,14 @@ def party_numeric_cols(df: pd.DataFrame) -> Tuple[List[str], str, str]:
     return party_cols, total_valid, informal
 
 
-def _scalar_fail(key: str, qa: float, official: float) -> Dict[str, Any]:
+def totals_triplet(valid: float, informal: float) -> Dict[str, Number]:
+    valid = float(valid)
+    informal = float(informal)
+    return {"valid": valid, "informal": informal, "valid_plus_informal": valid + informal}
+
+
+def fail_kv(key: str, qa: float, official: float) -> Dict[str, Any]:
+    qa = float(qa); official = float(official)
     diff = official - qa
     pct = (diff / qa * 100.0) if qa != 0 else (0.0 if official == 0 else float("inf"))
     return {
@@ -150,15 +165,7 @@ def _scalar_fail(key: str, qa: float, official: float) -> Dict[str, Any]:
     }
 
 
-def totals_triplet(valid: float, informal: float) -> Dict[str, float]:
-    return {
-        "valid": float(valid),
-        "informal": float(informal),
-        "valid_plus_informal": float(valid + informal),
-    }
-
-
-# ---------------- roster extraction + porting ----------------
+# ---------------- roster extraction ----------------
 
 def extract_candidate_roster(df: pd.DataFrame, totals_idx: Optional[int]) -> pd.DataFrame:
     if totals_idx is None or df.shape[1] < 5:
@@ -244,7 +251,7 @@ def port_party_roster_csv(party_csv: Path, out_csv: Path) -> None:
     roster.to_csv(out_csv, index=False, encoding="utf-8")
 
 
-# ---------------- detailed checksum builders (JSON-friendly) ----------------
+# ---------------- detailed atomic checksums ----------------
 
 def checksum_candidate_atomic_detailed(candidate_csv: Path) -> Dict[str, Any]:
     df = read_csv_atomic(candidate_csv)
@@ -273,44 +280,38 @@ def checksum_candidate_atomic_detailed(candidate_csv: Path) -> Dict[str, Any]:
 
     atomic = df.iloc[:trow].copy()
 
-    # provided totals triplet
     provided_total_valid = float(df.loc[trow, total_valid_col]) if pd.notna(df.loc[trow, total_valid_col]) else 0.0
     provided_total_inf = float(df.loc[trow, informal_col]) if pd.notna(df.loc[trow, informal_col]) else 0.0
     result["totals"] = totals_triplet(provided_total_valid, provided_total_inf)
 
-    # (1) per-row valid sum check + record row totals
     for i in range(atomic.shape[0]):
         loc = location_pair(df, i)
         qa_valid = float(atomic.iloc[i][cand_cols].sum(skipna=True))
         official_valid = float(atomic.iloc[i][total_valid_col]) if pd.notna(atomic.iloc[i][total_valid_col]) else 0.0
         row_inf = float(atomic.iloc[i][informal_col]) if pd.notna(atomic.iloc[i][informal_col]) else 0.0
-
-        row_payload = {"location": loc, "row_totals": totals_triplet(official_valid, row_inf)}
+        payload = {"location": loc, "row_totals": totals_triplet(official_valid, row_inf)}
         if qa_valid == official_valid:
-            result["checks"]["voting_place_row_sum_vs_total_valid_column"]["passed"].append(row_payload)
+            result["checks"]["voting_place_row_sum_vs_total_valid_column"]["passed"].append(payload)
         else:
-            result["checks"]["voting_place_row_sum_vs_total_valid_column"]["failed"].append({**row_payload, **_scalar_fail("valid_row_sum", qa_valid, official_valid)})
+            result["checks"]["voting_place_row_sum_vs_total_valid_column"]["failed"].append({**payload, **fail_kv("valid_row_sum", qa_valid, official_valid)})
 
     atomic_sums = atomic[cand_cols + [total_valid_col, informal_col]].sum(numeric_only=True)
 
-    # (2) totals-row candidate cols vs atomic sums
     for c in cand_cols + [total_valid_col]:
         qa = float(atomic_sums[c]) if pd.notna(atomic_sums[c]) else 0.0
         official = float(df.loc[trow, c]) if pd.notna(df.loc[trow, c]) else 0.0
         if qa == official:
             result["checks"]["totals_row_candidate_cols_vs_atomic_sums"]["passed"].append({"key": str(c)})
         else:
-            result["checks"]["totals_row_candidate_cols_vs_atomic_sums"]["failed"].append(_scalar_fail(str(c), qa, official))
+            result["checks"]["totals_row_candidate_cols_vs_atomic_sums"]["failed"].append(fail_kv(str(c), qa, official))
 
-    # (3) informal column sum vs totals informal
     qa_inf = float(atomic_sums[informal_col]) if pd.notna(atomic_sums[informal_col]) else 0.0
     official_inf = float(df.loc[trow, informal_col]) if pd.notna(df.loc[trow, informal_col]) else 0.0
     if qa_inf == official_inf:
         result["checks"]["informal_column_sum_vs_totals"]["passed"].append({"key": informal_col})
     else:
-        result["checks"]["informal_column_sum_vs_totals"]["failed"].append(_scalar_fail(informal_col, qa_inf, official_inf))
+        result["checks"]["informal_column_sum_vs_totals"]["failed"].append(fail_kv(informal_col, qa_inf, official_inf))
 
-    # (4) valid + informal extra row check
     qa_total_ballots = float(provided_total_valid + provided_total_inf)
     found = False
     for j in range(trow + 1, min(trow + 6, df.shape[0])):
@@ -322,12 +323,11 @@ def checksum_candidate_atomic_detailed(candidate_csv: Path) -> Dict[str, Any]:
             if official == qa_total_ballots:
                 result["checks"]["valid_plus_informal_row_check"]["passed"].append({"key": "valid_plus_informal"})
             else:
-                result["checks"]["valid_plus_informal_row_check"]["failed"].append(_scalar_fail("valid_plus_informal", qa_total_ballots, official))
+                result["checks"]["valid_plus_informal_row_check"]["failed"].append(fail_kv("valid_plus_informal", qa_total_ballots, official))
             break
     if not found:
         result["checks"]["valid_plus_informal_row_check"]["failed"].append({"key": "ROW_AFTER_TOTALS_NOT_FOUND"})
 
-    # (5) roster totals vs atomic sums
     roster = extract_candidate_roster(df, trow)
     atomic_by_candidate = {str(c).strip(): float(atomic[c].sum(skipna=True)) for c in cand_cols}
     if roster.empty:
@@ -343,7 +343,7 @@ def checksum_candidate_atomic_detailed(candidate_csv: Path) -> Dict[str, Any]:
             if qa == official:
                 result["checks"]["roster_candidate_totals_vs_atomic_sums"]["passed"].append({"key": name})
             else:
-                result["checks"]["roster_candidate_totals_vs_atomic_sums"]["failed"].append(_scalar_fail(name, float(qa), official))
+                result["checks"]["roster_candidate_totals_vs_atomic_sums"]["failed"].append(fail_kv(name, float(qa), official))
 
     return result
 
@@ -384,12 +384,11 @@ def checksum_party_atomic_detailed(party_csv: Path) -> Dict[str, Any]:
         qa_valid = float(atomic.iloc[i][party_cols].sum(skipna=True))
         official_valid = float(atomic.iloc[i][total_valid_col]) if pd.notna(atomic.iloc[i][total_valid_col]) else 0.0
         row_inf = float(atomic.iloc[i][informal_col]) if pd.notna(atomic.iloc[i][informal_col]) else 0.0
-
-        row_payload = {"location": loc, "row_totals": totals_triplet(official_valid, row_inf)}
+        payload = {"location": loc, "row_totals": totals_triplet(official_valid, row_inf)}
         if qa_valid == official_valid:
-            result["checks"]["voting_place_row_sum_vs_total_valid_column"]["passed"].append(row_payload)
+            result["checks"]["voting_place_row_sum_vs_total_valid_column"]["passed"].append(payload)
         else:
-            result["checks"]["voting_place_row_sum_vs_total_valid_column"]["failed"].append({**row_payload, **_scalar_fail("valid_row_sum", qa_valid, official_valid)})
+            result["checks"]["voting_place_row_sum_vs_total_valid_column"]["failed"].append({**payload, **fail_kv("valid_row_sum", qa_valid, official_valid)})
 
     atomic_sums = atomic[party_cols + [total_valid_col, informal_col]].sum(numeric_only=True)
 
@@ -399,14 +398,14 @@ def checksum_party_atomic_detailed(party_csv: Path) -> Dict[str, Any]:
         if qa == official:
             result["checks"]["totals_row_party_cols_vs_atomic_sums"]["passed"].append({"key": str(c)})
         else:
-            result["checks"]["totals_row_party_cols_vs_atomic_sums"]["failed"].append(_scalar_fail(str(c), qa, official))
+            result["checks"]["totals_row_party_cols_vs_atomic_sums"]["failed"].append(fail_kv(str(c), qa, official))
 
     qa_inf = float(atomic_sums[informal_col]) if pd.notna(atomic_sums[informal_col]) else 0.0
     official_inf = float(df.loc[trow, informal_col]) if pd.notna(df.loc[trow, informal_col]) else 0.0
     if qa_inf == official_inf:
         result["checks"]["informal_column_sum_vs_totals"]["passed"].append({"key": informal_col})
     else:
-        result["checks"]["informal_column_sum_vs_totals"]["failed"].append(_scalar_fail(informal_col, qa_inf, official_inf))
+        result["checks"]["informal_column_sum_vs_totals"]["failed"].append(fail_kv(informal_col, qa_inf, official_inf))
 
     qa_total_ballots = float(provided_total_valid + provided_total_inf)
     found = False
@@ -419,7 +418,7 @@ def checksum_party_atomic_detailed(party_csv: Path) -> Dict[str, Any]:
             if official == qa_total_ballots:
                 result["checks"]["valid_plus_informal_row_check"]["passed"].append({"key": "valid_plus_informal"})
             else:
-                result["checks"]["valid_plus_informal_row_check"]["failed"].append(_scalar_fail("valid_plus_informal", qa_total_ballots, official))
+                result["checks"]["valid_plus_informal_row_check"]["failed"].append(fail_kv("valid_plus_informal", qa_total_ballots, official))
             break
     if not found:
         result["checks"]["valid_plus_informal_row_check"]["failed"].append({"key": "ROW_AFTER_TOTALS_NOT_FOUND"})
@@ -439,6 +438,135 @@ def checksum_party_atomic_detailed(party_csv: Path) -> Dict[str, Any]:
             if qa == official:
                 result["checks"]["roster_party_totals_vs_atomic_sums"]["passed"].append({"key": name})
             else:
-                result["checks"]["roster_party_totals_vs_atomic_sums"]["failed"].append(_scalar_fail(name, float(qa), official))
+                result["checks"]["roster_party_totals_vs_atomic_sums"]["failed"].append(fail_kv(name, float(qa), official))
 
     return result
+
+
+# ---------------- Split-vote endstate checksums (2002) ----------------
+
+def _read_atomic_candidate_totals(candidate_csv: Path) -> Dict[str, float]:
+    df = read_csv_atomic(candidate_csv)
+    trow = find_totals_row(df)
+    if trow is None:
+        return {}
+    cand_cols, _, _ = candidate_numeric_cols(df)
+    for c in cand_cols:
+        df[c] = _to_num(df[c])
+    return {str(c).strip(): float(df.loc[trow, c]) if pd.notna(df.loc[trow, c]) else 0.0 for c in cand_cols}
+
+
+def _read_atomic_party_totals(party_csv: Path) -> Dict[str, float]:
+    df = read_csv_atomic(party_csv)
+    trow = find_totals_row(df)
+    if trow is None:
+        return {}
+    party_cols, _, _ = party_numeric_cols(df)
+    for c in party_cols:
+        df[c] = _to_num(df[c])
+    return {str(c).strip(): float(df.loc[trow, c]) if pd.notna(df.loc[trow, c]) else 0.0 for c in party_cols}
+
+
+def checksum_splitvote_endstate_2002(
+    split_endstate_csv: Path,
+    candidate_csv: Path,
+    party_csv: Path,
+) -> Dict[str, Any]:
+    """Checks the endstate splitvote matrix against row/col totals and atomic totals."""
+    mat = pd.read_csv(split_endstate_csv)
+
+    required = {"Party", "Sum_from_split_vote_counts", "Total Party Votes", "QA_Total_Party_Votes_from_atomic_party", "consistent"}
+    if not required.issubset(set(mat.columns)):
+        return {
+            "file": str(split_endstate_csv),
+            "error": f"Missing required columns: {sorted(required - set(mat.columns))}",
+            "checks": {},
+        }
+
+    # Separate main rows from bottom summary rows
+    def is_summary_party(p: str) -> bool:
+        p = str(p).strip().lower()
+        return p in {"sum_from_split_vote_counts", "provided_party_vote_totals_row", "residual_deviation"}
+
+    main = mat[~mat["Party"].astype(str).apply(is_summary_party)].copy()
+
+    # Candidate/informal/partyonly columns are everything except the final 4 bookkeeping cols.
+    bookkeeping = ["Sum_from_split_vote_counts", "Total Party Votes", "QA_Total_Party_Votes_from_atomic_party", "consistent"]
+    cand_cols = [c for c in mat.columns if c not in ["Party"] + bookkeeping]
+
+    for c in cand_cols + bookkeeping[0:3]:
+        main[c] = pd.to_numeric(main[c], errors="coerce").fillna(0.0)
+
+    # Row consistency: record failures (should match bool column but recompute here)
+    row_fail = []
+    for _, r in main.iterrows():
+        party = str(r["Party"]).strip()
+        qa_sum = float(r[cand_cols].sum())
+        split_total = float(r["Total Party Votes"])
+        atomic_total = float(r["QA_Total_Party_Votes_from_atomic_party"])
+        ok = (qa_sum == split_total) and (qa_sum == atomic_total)
+        if not ok:
+            row_fail.append({
+                "party": party,
+                "qa_sum_of_row": qa_sum,
+                "split_total_party_votes": split_total,
+                "atomic_party_total": atomic_total,
+            })
+
+    # Column sums vs atomic candidate totals
+    atomic_cands = _read_atomic_candidate_totals(candidate_csv)
+    col_fail = []
+    col_pass = []
+    for c in cand_cols:
+        key = str(c).strip()
+        if key not in atomic_cands:
+            continue
+        qa = float(main[c].sum())
+        official = float(atomic_cands[key])
+        if qa == official:
+            col_pass.append({"key": key})
+        else:
+            col_fail.append(fail_kv(key, qa, official))
+
+    # Party totals vs atomic party totals
+    atomic_party = _read_atomic_party_totals(party_csv)
+    party_fail = []
+    party_pass = []
+    for _, r in main.iterrows():
+        party = str(r["Party"]).strip()
+        if party not in atomic_party:
+            continue
+        qa = float(r["Total Party Votes"])
+        official = float(atomic_party[party])
+        if qa == official:
+            party_pass.append({"party": party})
+        else:
+            party_fail.append(fail_kv(party, qa, official))
+
+    # Provided totals row vs QA totals row (if present in file)
+    def find_row(label: str) -> Optional[pd.Series]:
+        hit = mat[mat["Party"].astype(str).str.strip().str.lower() == label.lower()]
+        return hit.iloc[0] if len(hit) else None
+
+    qa_row = find_row("Sum_from_split_vote_counts")
+    prov_row = find_row("Provided_party_vote_totals_row")
+    totals_row_fail = []
+    totals_row_pass = []
+    if qa_row is not None and prov_row is not None:
+        for c in cand_cols + ["Total Party Votes"]:
+            qa = float(pd.to_numeric(qa_row[c], errors="coerce") or 0.0)
+            official = float(pd.to_numeric(prov_row[c], errors="coerce") or 0.0)
+            if qa == official:
+                totals_row_pass.append({"key": c})
+            else:
+                totals_row_fail.append(fail_kv(c, qa, official))
+
+    return {
+        "file": str(split_endstate_csv),
+        "checks": {
+            "splitvote_row_consistency_bool": {"passed": [], "failed": row_fail},
+            "splitvote_candidate_column_sums_vs_atomic_candidate_totals": {"passed": col_pass, "failed": col_fail},
+            "splitvote_party_totals_vs_atomic_party_totals": {"passed": party_pass, "failed": party_fail},
+            "splitvote_provided_totals_row_vs_qa_totals_row": {"passed": totals_row_pass, "failed": totals_row_fail},
+        },
+    }

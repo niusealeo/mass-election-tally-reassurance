@@ -65,3 +65,4 @@ def build_jobs(hash_index_path: Path, input_root: Path) -> List[ElectorateJob]:
         jobs.append(ElectorateJob(termKey, year, ef, num, name, None, split_path, cand_path, party_path))
 
     return jobs
+

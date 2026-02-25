@@ -25,10 +25,10 @@ def main():
         input_root=Path(args.input_root).resolve(),
         output_root=Path(args.output_root).resolve(),
         downloaded_hash_index_path=Path(args.downloaded_hash_index).resolve(),
-        electorates_by_term_path=(Path(args.electorates_by_term).resolve() if args.electorates_by_term else None),
         terms=args.terms,
         min_year=args.min_year,
         max_year=args.max_year,
+        electorates_by_term_path=(Path(args.electorates_by_term).resolve() if args.electorates_by_term else None),
     )
 
 if __name__ == "__main__":
