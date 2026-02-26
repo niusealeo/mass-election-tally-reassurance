@@ -168,11 +168,13 @@ def fail_kv(key: str, qa: float, official: float) -> Dict[str, Any]:
 # ---------------- roster extraction ----------------
 
 def extract_candidate_roster(df: pd.DataFrame, totals_idx: Optional[int]) -> pd.DataFrame:
-    if totals_idx is None or df.shape[1] < 5:
+    # Candidate roster section (2002-2023) is typically:
+    #   candidate name | party | total candidate votes | ...
+    # and appears after the voting-place table + totals row.
+    if totals_idx is None or df.shape[1] < 3:
         return pd.DataFrame(columns=["candidate", "party", "total_candidate_votes"])
 
-    c0, c1 = df.columns[0], df.columns[1]
-    cand_cols, _, _ = candidate_numeric_cols(df)
+    c0, c1, c2 = df.columns[0], df.columns[1], df.columns[2]
 
     start = totals_idx + 1
     marker = None
@@ -190,24 +192,33 @@ def extract_candidate_roster(df: pd.DataFrame, totals_idx: Optional[int]) -> pd.
         party = df.iloc[i][c1]
         if pd.isna(cand) or str(cand).strip() in ["", "nan"]:
             continue
-        totals = _to_num(df.loc[i, cand_cols]) if cand_cols else pd.Series(dtype=float)
-        tot_val = float(totals.dropna().iloc[0]) if len(totals.dropna()) else None
-        if tot_val is None:
-            continue
+        tot_val = _to_num(pd.Series([df.iloc[i][c2]])).iloc[0]
+        if pd.isna(tot_val):
+            found = None
+            for j in range(2, min(df.shape[1], 6)):
+                v = _to_num(pd.Series([df.iloc[i][df.columns[j]]])).iloc[0]
+                if pd.notna(v):
+                    found = v
+                    break
+            if found is None:
+                continue
+            tot_val = found
         rows.append({
             "candidate": str(cand).strip(),
             "party": "" if pd.isna(party) else str(party).strip(),
-            "total_candidate_votes": tot_val,
+            "total_candidate_votes": float(tot_val),
         })
     return pd.DataFrame(rows)
 
 
 def extract_party_roster(df: pd.DataFrame, totals_idx: Optional[int]) -> pd.DataFrame:
-    if totals_idx is None or df.shape[1] < 4:
+    # Party roster section (2002-2023) is typically:
+    #   party name | total party votes | ...
+    # and appears after the voting-place table + totals row.
+    if totals_idx is None or df.shape[1] < 2:
         return pd.DataFrame(columns=["party", "total_party_votes"])
 
-    c0, c1 = df.columns[0], df.columns[1]
-    party_cols, _, _ = party_numeric_cols(df)
+    c0 = df.columns[0]
 
     start = totals_idx + 1
     marker = None
@@ -224,15 +235,15 @@ def extract_party_roster(df: pd.DataFrame, totals_idx: Optional[int]) -> pd.Data
         party = df.iloc[i][c0]
         if pd.isna(party) or str(party).strip() in ["", "nan"]:
             continue
-        tot1 = _to_num(pd.Series([df.iloc[i][c1]])).iloc[0]
-        if pd.notna(tot1):
-            rows.append({"party": str(party).strip(), "total_party_votes": float(tot1)})
+        found = None
+        for j in range(1, min(df.shape[1], 6)):
+            v = _to_num(pd.Series([df.iloc[i][df.columns[j]]])).iloc[0]
+            if pd.notna(v):
+                found = v
+                break
+        if found is None:
             continue
-        totals = _to_num(df.loc[i, party_cols]) if party_cols else pd.Series(dtype=float)
-        tot_val = float(totals.dropna().iloc[0]) if len(totals.dropna()) else None
-        if tot_val is None:
-            continue
-        rows.append({"party": str(party).strip(), "total_party_votes": tot_val})
+        rows.append({"party": str(party).strip(), "total_party_votes": float(found)})
 
     return pd.DataFrame(rows)
 

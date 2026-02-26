@@ -7,34 +7,6 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 
-def _dedupe_columns(cols) -> List[str]:
-    """Return a list of *unique* column names.
-
-    Pandas allows duplicate column labels. If a label is duplicated, `df[label]`
-    returns a DataFrame (not a Series) which breaks downstream `.str` accessors.
-    We keep the first occurrence as-is and suffix subsequent duplicates with
-    `.1`, `.2`, ... similar to pandas' historical behavior.
-    """
-
-    seen: Dict[str, int] = {}
-    out: List[str] = []
-    for c in cols:
-        base = str(c).strip()
-        if base in seen:
-            seen[base] += 1
-            out.append(f"{base}.{seen[base]}")
-        else:
-            seen[base] = 0
-            out.append(base)
-    return out
-
-
-def _col_base(name: str) -> str:
-    """Lowercased column name with any `.N` dedupe suffix removed."""
-    s = str(name).strip().lower()
-    return re.sub(r"\.\d+$", "", s)
-
-
 def _strip_trailing_dot_zero(v):
     """For CSV writing: turn 123.0 -> '123', keep 123.5 -> '123.5'."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -65,9 +37,18 @@ def read_xls_sheet0(path: Path) -> pd.DataFrame:
     """
     return pd.read_excel(path, sheet_name=0, engine="xlrd")
 
+
+def _coerce_num_series(s: pd.Series) -> pd.Series:
+    if s.dtype == object:
+        s2 = s.astype(str).str.replace(",", "", regex=False).str.strip()
+    else:
+        s2 = s
+    return pd.to_numeric(s2, errors="coerce")
+
 def process_2002_split_sheet_df_to_endstate(
     df: pd.DataFrame,
     atomic_party_totals: Dict[str, float],
+    candidate_order: Optional[List[str]],
     out_csv: Path,
 ) -> None:
     """Convert 2002-style split votes sheet0 dataframe to our endstate CSV format.
@@ -82,79 +63,169 @@ def process_2002_split_sheet_df_to_endstate(
       - Include bottom summary rows: Sum_from_split_vote_counts, Provided_party_vote_totals_row, RESIDUAL_DEVIATION
       - Numbers should not include trailing .0
     """
-    # Clean up column labels early (strip, stringify, and *dedupe*).
-    df = df.copy()
-    df.columns = _dedupe_columns([str(c).strip() for c in df.columns])
+    # --- 2002 split XLS structure (per project PDF):
+    # Party | Party Vote Totals | (Candidate Count, Candidate % of party vote)* | Informals (count, %) | Party Only (count, %) | (sometimes other % columns)
+    # We must:
+    #   1) find the real header row (the sheet has a preamble)
+    #   2) keep ONLY the *count* columns (drop % columns)
+    #   3) label candidate columns deterministically (prefer atomic candidate column order)
+    #   4) treat Party Vote Totals (count) as "Total Party Votes" in the endstate.
 
-    # Heuristics: find the header row that contains 'party' (row label) and candidate columns.
-    # If df already has header row as columns, we're good. If it looks like a raw sheet, coerce first row to header.
-    if "Party" not in df.columns and "party" not in [str(c).strip().lower() for c in df.columns]:
-        # Try promote first row to header
-        df2 = df.copy()
-        df2.columns = _dedupe_columns([str(x).strip() for x in df2.iloc[0].tolist()])
-        df2 = df2.iloc[1:].reset_index(drop=True)
-        df = df2
+    def _find_header_row(raw: pd.DataFrame) -> Optional[int]:
+        for i in range(min(60, raw.shape[0])):
+            row = raw.iloc[i].tolist()
+            lowered = [str(x).strip().casefold() for x in row]
+            if any(x == "party" for x in lowered):
+                nonempty = sum(1 for x in lowered if x and x != "nan")
+                if nonempty >= 3:
+                    return i
+        return None
 
-    # Normalise 'Party' column name
-    party_col = None
-    for c in df.columns:
-        if _col_base(c) == "party":
-            party_col = c
-            break
+    header_i = _find_header_row(df)
+    if header_i is not None:
+        hdr_raw = df.iloc[header_i].tolist()
+        hdr = [None if (pd.isna(x) or str(x).strip() == "") else str(x).strip() for x in hdr_raw]
+        # Forward-fill header cells (merged cells create blanks).
+        filled: List[Optional[str]] = []
+        last: Optional[str] = None
+        for x in hdr:
+            if x is None:
+                filled.append(last)
+            else:
+                filled.append(x)
+                last = x
+        df = df.iloc[header_i + 1 :].copy().reset_index(drop=True)
+        df.columns = ["Party" if (x and str(x).strip().casefold() == "party") else (x if x is not None else "") for x in filled]
+
+    # Normalise Party column (fallback: first column)
+    party_col = next((c for c in df.columns if str(c).strip().casefold() == "party"), None)
     if party_col is None:
-        # Sometimes 'Party Name'
-        for c in df.columns:
-            if "party" in _col_base(c):
-                party_col = c
-                break
-    if party_col is None:
-        raise ValueError("Could not find Party column in 2002 split-votes sheet")
-
+        party_col = df.columns[0]
     df = df.rename(columns={party_col: "Party"})
 
-    # Identify total party votes column
-    total_party_col = None
-    for c in df.columns:
-        if _col_base(c) in {"total party votes", "total_party_votes", "total"}:
-            total_party_col = c
-            # Don't break: if there are multiple total-like columns, prefer the *last* one.
-    if total_party_col is None:
-        # fallback: last numeric column
-        total_party_col = df.columns[-1]
+    # Trim leading preamble rows so the first row is a party label
+    def _is_data_party(v: object) -> bool:
+        if pd.isna(v):
+            return False
+        s = str(v).strip()
+        if not s or s.casefold() == "nan":
+            return False
+        # header-ish or title-ish rows
+        if "split" in s.casefold() and "party" in s.casefold():
+            return False
+        return True
 
-    # Candidate/informal/partyonly columns are everything except Party and total party votes
-    candidate_cols = [c for c in df.columns if c not in ["Party", total_party_col]]
+    first_party_row = None
+    for i in range(df.shape[0]):
+        if _is_data_party(df.loc[i, "Party"]):
+            first_party_row = i
+            break
+    if first_party_row is None:
+        raise ValueError("Could not locate first party row in 2002 split-votes sheet")
+    df = df.iloc[first_party_row:].copy().reset_index(drop=True)
 
-    # Coerce numerics
-    for c in candidate_cols + [total_party_col]:
-        col = df[c]
-        # With deduped columns this should be a Series, but keep a defensive fallback.
-        if isinstance(col, pd.DataFrame):
-            for subc in col.columns:
-                df[subc] = pd.to_numeric(
-                    df[subc].astype(str).str.replace(",", "", regex=False),
-                    errors="coerce",
-                ).fillna(0.0)
-        else:
-            df[c] = pd.to_numeric(
-                col.astype(str).str.replace(",", "", regex=False),
-                errors="coerce",
-            ).fillna(0.0)
+    cols = list(df.columns)
+    if len(cols) < 3:
+        raise ValueError("Split-votes sheet too narrow to parse")
 
-    # Build QA_total column from atomic_party_totals, by party name match
+    # In 2002 sheets the Party Vote Totals is the first numeric column after Party.
+    party_total_col = cols[1]
+
+    # Coerce all non-Party columns to numeric best-effort
+    for c in cols[1:]:
+        df[c] = _coerce_num_series(df[c])
+
+    # Identify percent columns and drop them.
+    def _is_percent_col(col: str) -> bool:
+        name = str(col).casefold()
+        if "%" in name or "percent" in name:
+            return True
+        v = df[col]
+        v = v[pd.notna(v)]
+        if len(v) == 0:
+            return False
+        vmax = float(v.max())
+        if vmax <= 1.5:
+            frac = (v % 1).abs()
+            nonint = float((frac > 1e-9).mean()) if len(frac) else 0.0
+            if nonint >= 0.2:
+                return True
+        return False
+
+    nonparty_cols = cols[1:]
+    count_cols = [c for c in nonparty_cols if not _is_percent_col(c)]
+
+    # count_cols includes Party Vote Totals (counts) + candidate/informal/party-only count columns.
+    after_total = [c for c in count_cols if c != party_total_col]
+
+    if candidate_order:
+        cand_n = len(candidate_order)
+        candidate_count_cols = after_total[:cand_n]
+        extra_cols = after_total[cand_n:]
+        rename_map = {candidate_count_cols[i]: candidate_order[i] for i in range(min(len(candidate_count_cols), cand_n))}
+        df = df.rename(columns=rename_map)
+        candidate_cols = candidate_order[: len(candidate_count_cols)] + [str(c) for c in extra_cols]
+    else:
+        candidate_cols = [str(c) for c in after_total]
+
+    # Keep only Party + counts
+    keep_cols = ["Party", party_total_col] + candidate_cols
+    keep_cols = [c for c in keep_cols if c in df.columns]
+    df = df[keep_cols].copy().fillna(0.0)
+
+    # Build QA_total column from atomic_party_totals.
+    # 2002 split sheets often use long party names while atomic totals use abbreviations.
     def norm_party(s: str) -> str:
-        return re.sub(r"\s+", " ", str(s).strip()).casefold()
+        s = str(s).strip().casefold()
+        s = re.sub(r"[^a-z0-9]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
-    atomic_lookup = {norm_party(k): float(v) for k, v in atomic_party_totals.items()}
+    explicit = {
+        "act new zealand": "ACT",
+        "new zealand first party": "NZ First",
+        "jim anderton s progressive coalition": "Progressive Coalition",
+        "aotearoa legalise cannabis party": "Legalise Cannabis",
+        "mana maori movement": "Mana Maori",
+        "outdoor recreation nz": "Outdoor Rec. NZ",
+        "christian heritage party": "Christian Heritage",
+    }
 
-    qa_party = []
-    for p in df["Party"].tolist():
-        qa_party.append(atomic_lookup.get(norm_party(p), 0.0))
-    df["QA_Total_Party_Votes_from_atomic_party"] = qa_party
+    def map_party_label(p: object) -> str:
+        p0 = "" if pd.isna(p) else str(p).strip()
+        n = norm_party(p0)
+        if n in explicit and explicit[n] in atomic_party_totals:
+            return explicit[n]
+        for k, target in [
+            ("act", "ACT"),
+            ("labour", "Labour Party"),
+            ("national", "National Party"),
+            ("green", "Green Party"),
+            ("united future", "United Future"),
+            ("alliance", "Alliance"),
+            ("legalise cannabis", "Legalise Cannabis"),
+            ("progressive", "Progressive Coalition"),
+            ("new zealand first", "NZ First"),
+            ("one nz", "OneNZ Party"),
+            ("outdoor", "Outdoor Rec. NZ"),
+            ("christian heritage", "Christian Heritage"),
+            ("mana maori", "Mana Maori"),
+            ("nmp", "NMP"),
+        ]:
+            if k in n and target in atomic_party_totals:
+                return target
+        # If already an atomic label, keep it
+        if p0 in atomic_party_totals:
+            return p0
+        return p0
+
+    df["Party"] = df["Party"].apply(map_party_label)
+    df["QA_Total_Party_Votes_from_atomic_party"] = df["Party"].apply(lambda p: float(atomic_party_totals.get(str(p), 0.0)))
 
     # Row sums and consistency
     df["Sum_from_split_vote_counts"] = df[candidate_cols].sum(axis=1)
-    df["Total Party Votes"] = df[total_party_col]
+    # Party Vote Totals column is the authoritative split per-row total.
+    df["Total Party Votes"] = df[party_total_col]
     df["consistent"] = (df["Sum_from_split_vote_counts"] == df["Total Party Votes"]) & (
         df["Sum_from_split_vote_counts"] == df["QA_Total_Party_Votes_from_atomic_party"]
     )
@@ -189,10 +260,11 @@ def process_2002_split_sheet_df_to_endstate(
 def process_2002_split_xls_to_endstate(
     xls_path: Path,
     atomic_party_totals: Dict[str, float],
+    candidate_order: Optional[List[str]],
     out_csv: Path,
 ) -> None:
     df = read_xls_sheet0(xls_path)
-    process_2002_split_sheet_df_to_endstate(df, atomic_party_totals, out_csv)
+    process_2002_split_sheet_df_to_endstate(df, atomic_party_totals, candidate_order, out_csv)
 
 
 def process_split_votes_csv_to_endstate(*args, **kwargs):

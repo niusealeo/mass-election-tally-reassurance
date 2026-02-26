@@ -13,6 +13,9 @@ from .checksums import (
     checksum_candidate_atomic_detailed,
     checksum_party_atomic_detailed,
     checksum_splitvote_endstate_2002,
+    port_candidate_roster_csv,
+    port_party_roster_csv,
+    _read_atomic_candidate_totals,
     _read_atomic_party_totals,
 )
 from .discovery import ElectorateJob, build_jobs
@@ -145,6 +148,18 @@ def run_all(
         if job.party_path and job.party_path.exists():
             party_detail = checksum_party_atomic_detailed(job.party_path)
 
+        # Always emit rosters when atomic files exist (used downstream for labelling + auditing)
+        if job.cand_path and job.cand_path.exists():
+            try:
+                port_candidate_roster_csv(job.cand_path, out_elec / f"{job.electorateFolder}_candidate_roster.csv")
+            except Exception:
+                pass
+        if job.party_path and job.party_path.exists():
+            try:
+                port_party_roster_csv(job.party_path, out_elec / f"{job.electorateFolder}_party_roster.csv")
+            except Exception:
+                pass
+
         # Determine if atomic checks are clean
         def has_fail(detail: Optional[dict]) -> bool:
             if not detail or "checks" not in detail:
@@ -163,7 +178,12 @@ def run_all(
         if job.year == 2002 and job.split_path and job.split_path.exists() and job.party_path and job.party_path.exists():
             split_endstate_path = out_elec / f"{job.electorateFolder}_split_votes_endstate.csv"
             atomic_party_totals = _read_atomic_party_totals(job.party_path)
-            process_2002_split_xls_to_endstate(job.split_path, atomic_party_totals, split_endstate_path)
+            candidate_order = None
+            if job.cand_path and job.cand_path.exists():
+                # Use the atomic candidate totals columns (ordered) to label split columns.
+                atomic_cand_totals = _read_atomic_candidate_totals(job.cand_path)
+                candidate_order = [k for k in atomic_cand_totals.keys() if str(k).strip()]
+            process_2002_split_xls_to_endstate(job.split_path, atomic_party_totals, candidate_order, split_endstate_path)
             split_detail = checksum_splitvote_endstate_2002(split_endstate_path, job.cand_path, job.party_path)
 
         # Write per-electorate checksum jsons
