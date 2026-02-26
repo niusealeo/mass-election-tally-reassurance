@@ -44,11 +44,10 @@ For each electorate (2005–2023), it:
 
 ### C) 2002: Port split-vote XLS/XLSX into modern CSV format
 
-For 2002, split-vote information is stored in Excel (`.xls` and/or `.xlsx`). The tool ports this into a modern split-votes CSV layout.
+For 2002, split-vote information is stored in Excel (`.xls` and/or `.xls`). The tool ports this into a modern split-votes CSV layout.
 
 - `.xls` parsing uses **xlrd** (see dependencies below).
-- `.xlsx` parsing uses pandas/openpyxl.
-
+- `.xls` parsing uses pandas/
 The output is written into the matching electorate directory under the output root, mirroring the input structure.
 
 ---
@@ -63,7 +62,7 @@ You must provide:
 The script uses `downloaded_hash_index.json` to discover, for each electorate:
 - a candidate atomic file (contains “cand” in filename),
 - a party atomic file (contains “party” in filename),
-- a split-vote file (contains “split” or is `.xls/.xlsx` for 2002).
+- a split-vote file (contains “split” or is `.xls/.xls` for 2002).
 
 > This is intentionally filename-robust: it doesn’t hardcode “2017+” names vs “e9_part8” names; it discovers them from the hash index.
 
@@ -121,7 +120,7 @@ This tool supports the real-world NZEC packaging differences:
 
 - **2002**
   - atomic files: `e9_part8_cand_*.csv`, `e9_part8_party_*.csv`
-  - split: Excel `.xls/.xlsx`
+  - split: Excel `.xls/.xls`
 
 - **2005**
   - atomic files: `e9_part8_cand_*.csv`, `e9_part8_party_*.csv`
@@ -190,8 +189,7 @@ Installed by `install.sh` / `install.ps1`:
 
 - `pandas`
 - `numpy`
-- `openpyxl` (for `.xlsx`)
-- `xlrd==1.2.0` (required for legacy `.xls`)
+- `- `xlrd>=1.2.0` (required for legacy `.xls`)
 
 ### Why `xlrd==1.2.0`?
 `xlrd` version 2.x dropped `.xls` support. `1.2.0` is the last release that can read `.xls` files.

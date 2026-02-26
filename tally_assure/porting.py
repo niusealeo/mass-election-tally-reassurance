@@ -30,13 +30,12 @@ def read_split_votes_csv(path: Path) -> pd.DataFrame:
 
 
 def read_xls_sheet0(path: Path) -> pd.DataFrame:
-    """Read sheet0 of xls/xlsx to a DataFrame."""
-    # .xls requires xlrd==1.2.0; .xlsx works via openpyxl through pandas
-    ext = path.suffix.lower()
-    if ext == ".xls":
-        return pd.read_excel(path, sheet_name=0, engine="xlrd")
-    return pd.read_excel(path, sheet_name=0)
+    """Read sheet0 of a legacy .xls workbook.
 
+    This repo uses pandas with engine='xlrd'. That requires xlrd>=2.0.1,
+    which supports .xls (and does not support xlsx).
+    """
+    return pd.read_excel(path, sheet_name=0, engine="xlrd")
 
 def process_2002_split_sheet_df_to_endstate(
     df: pd.DataFrame,
