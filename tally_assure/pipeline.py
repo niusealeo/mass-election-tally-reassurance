@@ -132,6 +132,31 @@ def run_all(
     term_pass: Dict[str, List[dict]] = {}
     term_fail: Dict[str, List[dict]] = {}
 
+    def _has_any(detail: Optional[dict], key: str) -> bool:
+        """Return True if any check group contains at least one entry under `key` (passed/failed)."""
+        if not detail or "checks" not in detail or not isinstance(detail["checks"], dict):
+            return False
+        for group in detail["checks"].values():
+            if isinstance(group, dict) and isinstance(group.get(key), list) and len(group[key]) > 0:
+                return True
+        return False
+
+    def _prune_detail(detail: Optional[dict], keep: str) -> Optional[dict]:
+        """Return a copy of `detail` that keeps only `keep` entries ('passed' or 'failed') in each check group."""
+        if detail is None:
+            return None
+        if "checks" not in detail or not isinstance(detail["checks"], dict):
+            return detail
+        out = dict(detail)
+        out_checks: Dict[str, Any] = {}
+        for name, group in detail["checks"].items():
+            if not isinstance(group, dict):
+                out_checks[name] = group
+                continue
+            out_checks[name] = {keep: list(group.get(keep, []))}
+        out["checks"] = out_checks
+        return out
+
     for job in sorted(jobs, key=lambda x: (x.termKey, int(x.alphabeticNumber or 10**9), x.electorateFolder)):
         termKey = job.termKey
         out_term = _output_term_folder(output_root, termKey)
@@ -202,27 +227,48 @@ def run_all(
             },
         }
 
-        pass_payload = {**elec_meta, "candidate": cand_detail, "party": party_detail, "splitvote": split_detail}
-        fail_payload = {**elec_meta, "candidate": cand_detail, "party": party_detail, "splitvote": split_detail}
+        # Determine whether there are any passed/failed checks in each subsystem.
+        cand_has_pass = _has_any(cand_detail, "passed")
+        cand_has_fail = _has_any(cand_detail, "failed")
+        party_has_pass = _has_any(party_detail, "passed")
+        party_has_fail = _has_any(party_detail, "failed")
+        split_has_pass = _has_any(split_detail, "passed")
+        split_has_fail = _has_any(split_detail, "failed")
 
-        # splitvote ok?
-        split_ok = True
-        if split_detail and "checks" in split_detail:
-            for group in split_detail["checks"].values():
-                if isinstance(group, dict) and group.get("failed"):
-                    if len(group["failed"]) > 0:
-                        split_ok = False
+        any_pass = cand_has_pass or party_has_pass or split_has_pass
+        any_fail = cand_has_fail or party_has_fail or split_has_fail or (not atomic_ok)
 
-        all_ok = atomic_ok and split_ok
+        # Write per-electorate checksum jsons.
+        # Rule:
+        # - pass json contains ONLY passed entries
+        # - fail json contains ONLY failed entries
+        # - if both exist, emit both
+        stamp = utc_s.replace(":", "").replace("-", "")
 
-        if all_ok:
-            out_pass = out_elec / f"{job.electorateFolder}_checksum_pass_{utc_s.replace(':','').replace('-','')}.json"
+        if any_pass:
+            out_pass = out_elec / f"{job.electorateFolder}_checksum_pass_{stamp}.json"
+            pass_payload = {
+                **elec_meta,
+                "candidate": _prune_detail(cand_detail, "passed"),
+                "party": _prune_detail(party_detail, "passed"),
+                "splitvote": _prune_detail(split_detail, "passed"),
+            }
             write_json(out_pass, pass_payload)
-            term_pass.setdefault(termKey, []).append({"electorateFolder": job.electorateFolder, "alphabeticNumber": job.alphabeticNumber})
-        else:
-            out_fail = out_elec / f"{job.electorateFolder}_checksum_fail_{utc_s.replace(':','').replace('-','')}.json"
+
+        if any_fail:
+            out_fail = out_elec / f"{job.electorateFolder}_checksum_fail_{stamp}.json"
+            fail_payload = {
+                **elec_meta,
+                "candidate": _prune_detail(cand_detail, "failed"),
+                "party": _prune_detail(party_detail, "failed"),
+                "splitvote": _prune_detail(split_detail, "failed"),
+            }
             write_json(out_fail, fail_payload)
             term_fail.setdefault(termKey, []).append({"electorateFolder": job.electorateFolder, "alphabeticNumber": job.alphabeticNumber})
+
+        # Term-level "pass" summary should mean: no failures for that electorate.
+        if not any_fail:
+            term_pass.setdefault(termKey, []).append({"electorateFolder": job.electorateFolder, "alphabeticNumber": job.alphabeticNumber})
 
     # per-term summary
     for termKey in sorted(set(list(term_pass.keys()) + list(term_fail.keys()))):
