@@ -7,6 +7,34 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 
+def _dedupe_columns(cols) -> List[str]:
+    """Return a list of *unique* column names.
+
+    Pandas allows duplicate column labels. If a label is duplicated, `df[label]`
+    returns a DataFrame (not a Series) which breaks downstream `.str` accessors.
+    We keep the first occurrence as-is and suffix subsequent duplicates with
+    `.1`, `.2`, ... similar to pandas' historical behavior.
+    """
+
+    seen: Dict[str, int] = {}
+    out: List[str] = []
+    for c in cols:
+        base = str(c).strip()
+        if base in seen:
+            seen[base] += 1
+            out.append(f"{base}.{seen[base]}")
+        else:
+            seen[base] = 0
+            out.append(base)
+    return out
+
+
+def _col_base(name: str) -> str:
+    """Lowercased column name with any `.N` dedupe suffix removed."""
+    s = str(name).strip().lower()
+    return re.sub(r"\.\d+$", "", s)
+
+
 def _strip_trailing_dot_zero(v):
     """For CSV writing: turn 123.0 -> '123', keep 123.5 -> '123.5'."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -54,25 +82,29 @@ def process_2002_split_sheet_df_to_endstate(
       - Include bottom summary rows: Sum_from_split_vote_counts, Provided_party_vote_totals_row, RESIDUAL_DEVIATION
       - Numbers should not include trailing .0
     """
+    # Clean up column labels early (strip, stringify, and *dedupe*).
+    df = df.copy()
+    df.columns = _dedupe_columns([str(c).strip() for c in df.columns])
+
     # Heuristics: find the header row that contains 'party' (row label) and candidate columns.
     # If df already has header row as columns, we're good. If it looks like a raw sheet, coerce first row to header.
     if "Party" not in df.columns and "party" not in [str(c).strip().lower() for c in df.columns]:
         # Try promote first row to header
         df2 = df.copy()
-        df2.columns = [str(x).strip() for x in df2.iloc[0].tolist()]
+        df2.columns = _dedupe_columns([str(x).strip() for x in df2.iloc[0].tolist()])
         df2 = df2.iloc[1:].reset_index(drop=True)
         df = df2
 
     # Normalise 'Party' column name
     party_col = None
     for c in df.columns:
-        if str(c).strip().lower() == "party":
+        if _col_base(c) == "party":
             party_col = c
             break
     if party_col is None:
         # Sometimes 'Party Name'
         for c in df.columns:
-            if "party" in str(c).strip().lower():
+            if "party" in _col_base(c):
                 party_col = c
                 break
     if party_col is None:
@@ -83,9 +115,9 @@ def process_2002_split_sheet_df_to_endstate(
     # Identify total party votes column
     total_party_col = None
     for c in df.columns:
-        if str(c).strip().lower() in {"total party votes", "total_party_votes", "total"}:
+        if _col_base(c) in {"total party votes", "total_party_votes", "total"}:
             total_party_col = c
-            break
+            # Don't break: if there are multiple total-like columns, prefer the *last* one.
     if total_party_col is None:
         # fallback: last numeric column
         total_party_col = df.columns[-1]
@@ -95,7 +127,19 @@ def process_2002_split_sheet_df_to_endstate(
 
     # Coerce numerics
     for c in candidate_cols + [total_party_col]:
-        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0.0)
+        col = df[c]
+        # With deduped columns this should be a Series, but keep a defensive fallback.
+        if isinstance(col, pd.DataFrame):
+            for subc in col.columns:
+                df[subc] = pd.to_numeric(
+                    df[subc].astype(str).str.replace(",", "", regex=False),
+                    errors="coerce",
+                ).fillna(0.0)
+        else:
+            df[c] = pd.to_numeric(
+                col.astype(str).str.replace(",", "", regex=False),
+                errors="coerce",
+            ).fillna(0.0)
 
     # Build QA_total column from atomic_party_totals, by party name match
     def norm_party(s: str) -> str:
