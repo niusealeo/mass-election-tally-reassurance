@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -38,12 +39,48 @@ def _closest_common_ancestor(a: Path, b: Path) -> Path:
     return Path(*ap[:i])
 
 
-def _relpath_from_common_ancestor(input_file: Path, output_file: Path) -> str:
-    anc = _closest_common_ancestor(input_file, output_file.parent)
+def _common_parent(paths: List[Optional[Path]]) -> Optional[Path]:
+    ps = [p.resolve() for p in paths if p is not None]
+    if not ps:
+        return None
     try:
-        return str(input_file.resolve().relative_to(anc))
+        return Path(os.path.commonpath([str(p) for p in ps]))
     except Exception:
-        return str(input_file)
+        # fallback: pairwise common ancestor
+        anc = ps[0]
+        for p in ps[1:]:
+            anc = _closest_common_ancestor(anc, p)
+        return anc
+
+
+def _rel_to_common(p: Optional[Path], common: Optional[Path]) -> Optional[str]:
+    if p is None:
+        return None
+    if common is None:
+        return str(p)
+    try:
+        return str(p.resolve().relative_to(common))
+    except Exception:
+        return str(p)
+
+
+def _relativize_detail(detail: Optional[dict], common: Optional[Path]) -> Optional[dict]:
+    if detail is None:
+        return None
+    out = dict(detail)
+    if "file" in out:
+        try:
+            out["file"] = _rel_to_common(Path(out["file"]), common)
+        except Exception:
+            pass
+    # some substructures store absolute 'file' fields too
+    for k in ["candidate", "party", "splitvote"]:
+        if k in out and isinstance(out[k], dict) and "file" in out[k]:
+            try:
+                out[k]["file"] = _rel_to_common(Path(out[k]["file"]), common)
+            except Exception:
+                pass
+    return out
 
 
 def _load_alphabetic_numbers(electorates_by_term_path: Path) -> Dict[str, Dict[str, int]]:
@@ -238,6 +275,7 @@ def run_all(
             split_detail = checksum_splitvote_endstate_2002(split_endstate_path, job.cand_path, job.party_path)
 
         # Write per-electorate checksum jsons
+        common_parent = _common_parent([job.split_path, job.cand_path, job.party_path, split_endstate_path, out_elec])
         elec_meta = {
             "termKey": termKey,
             "year": job.year,
@@ -247,9 +285,10 @@ def run_all(
             "alphabeticNumber": job.alphabeticNumber,
             "timestamps": {"utc": utc_s, "local": local_s},
             "paths": {
-                "split": _relpath_from_common_ancestor(job.split_path, out_elec) if job.split_path else None,
-                "candidate": _relpath_from_common_ancestor(job.cand_path, out_elec) if job.cand_path else None,
-                "party": _relpath_from_common_ancestor(job.party_path, out_elec) if job.party_path else None,
+                "split": _rel_to_common(job.split_path, common_parent),
+                "candidate": _rel_to_common(job.cand_path, common_parent),
+                "party": _rel_to_common(job.party_path, common_parent),
+                "split_endstate": _rel_to_common(split_endstate_path, common_parent) if split_endstate_path else None,
             },
         }
 
