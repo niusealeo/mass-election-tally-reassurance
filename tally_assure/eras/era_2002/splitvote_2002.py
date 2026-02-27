@@ -81,50 +81,51 @@ def process_2002_split_sheet_df_to_endstate(
 ) -> None:
     """Convert 2002-style split votes sheet0 dataframe to our endstate CSV format.
 
-    Endstate format requirements:
-      - Keep the splitvote matrix in 'wide' format.
-      - Include, at end of each row, 4 bookkeeping columns in this order:
-          4th-to-last: Sum_from_split_vote_counts (sum of candidate/informal/partyonly counts)
-          3rd-to-last : Total Party Votes (provided splitvote total)
-          2nd-to-last : QA_Total_Party_Votes_from_atomic_party (from atomic party csv totals row)
-          last        : consistent (bool)
-      - Include bottom summary rows: Sum_from_split_vote_counts, Provided_party_vote_totals_row, RESIDUAL_DEVIATION
-      - Numbers should not include trailing .0
+    This is *deterministic* for the known 2002 sheet layout:
+      - Preamble rows ignored by read_xls_sheet0(header=5).
+      - Column 0: Party name (header often blank)
+      - Column 1: Party Vote Totals (counts)
+      - Then repeating pairs: (count col, "% of party vote" col)
+      - Tail pairs: Informals (count, %), Party Only (count, %)
+      - Sometimes a final totals row like "Party vote totals".
+
+    Output requirements (current project spec):
+      - Keep original column titles for candidate/Informals/Party Only columns.
+      - Row order: party rows with candidates first ("Party (Candidate)"), then remaining rows.
+      - Bottom rows:
+          ... party rows ...
+          Sum_from_split_vote_counts        (sum of all rows above, column-wise)
+          Party vote totals                 (provided totals row from sheet, if present; otherwise omitted)
+          QA sums from the candidate csv    (candidate totals from atomic candidate CSV)
+          Consistent                        (bool iff the previous three rows are equal elementwise)
+      - No trailing .0s in numeric outputs.
+      - "Consistent" row result must be checkable downstream.
     """
-    # --- 2002 split XLS structure (per project PDF):
-    # Party | Party Vote Totals | (Candidate Count, Candidate % of party vote)* | Informals (count, %) | Party Only (count, %) | (sometimes other % columns)
-    # We must:
-    #   1) find the real header row (the sheet has a preamble)
-    #   2) keep ONLY the *count* columns (drop % columns)
-    #   3) label candidate columns deterministically (prefer atomic candidate column order)
-    #   4) treat Party Vote Totals (count) as "Total Party Votes" in the endstate.
 
-    # df is expected to already have its real header row applied (header=5 in read_xls_sheet0).
-    # The first four rows are preamble and are ignored; the column names live in the 6th row.
-    # We do not attempt to rediscover headers heuristically here.
     if df.shape[1] < 3:
-        raise ValueError('Split-votes sheet too narrow to parse')
-    # Ensure we have the Party Vote Totals column (authoritative per-row total).
-    if not any(str(c).strip().casefold() == 'party vote totals' for c in df.columns[1:]):
-        raise ValueError('Expected a "Party Vote Totals" column in 2002 split-votes sheet')
+        raise ValueError("Split-votes sheet too narrow to parse")
 
+    # Identify / rename party column
     party_col = next((c for c in df.columns if str(c).strip().casefold() == "party"), None)
     if party_col is None:
         party_col = df.columns[0]
     df = df.rename(columns={party_col: "Party"})
 
-    # Note: we decorate the party row labels *after* normalising party labels,
-    # so the decoration keys match downstream atomic comparisons.
+    # Find Party Vote Totals column (authoritative per-row total party votes)
+    cols = list(df.columns)
+    party_total_col = next((c for c in cols[1:] if str(c).strip().casefold() == "party vote totals"), None)
+    if party_total_col is None:
+        raise ValueError('Expected a "Party Vote Totals" column in 2002 split-votes sheet')
 
-    # Trim leading preamble rows so the first row is a party label
+    # Drop any leading non-data rows (sometimes blank lines remain after header)
     def _is_data_party(v: object) -> bool:
         if pd.isna(v):
             return False
         s = str(v).strip()
         if not s or s.casefold() == "nan":
             return False
-        # header-ish or title-ish rows
-        if "split" in s.casefold() and "party" in s.casefold():
+        # ignore title-ish remnants
+        if "part viii" in s.casefold() or "candidate vote" in s.casefold():
             return False
         return True
 
@@ -137,53 +138,40 @@ def process_2002_split_sheet_df_to_endstate(
         raise ValueError("Could not locate first party row in 2002 split-votes sheet")
     df = df.iloc[first_party_row:].copy().reset_index(drop=True)
 
-    cols = list(df.columns)
-    if len(cols) < 3:
-        raise ValueError("Split-votes sheet too narrow to parse")
-
-    # In 2002 sheets the Party Vote Totals is the first numeric column after Party.
-    party_total_col = next((c for c in cols[1:] if str(c).strip().casefold() == 'party vote totals'), cols[1])
-
-    # Coerce all non-Party columns to numeric best-effort
-    for c in cols[1:]:
+    # Coerce non-Party columns to numeric
+    for c in df.columns[1:]:
         df[c] = _coerce_num_series(df[c])
 
-    # Identify percent columns and drop them.
-    # Identify percent columns and drop them.
-    # 2002 split sheets repeat the literal header "% of party vote" for each candidate and for Informals/Party Only.
+    # Drop percent columns deterministically
     def _is_percent_col(col: str) -> bool:
         name = str(col).strip().casefold()
-        # pandas may dedupe duplicate headers as '.1', '.2' depending on version/engine
-        name = re.sub(r"\.\d+$", "", name)
+        name = re.sub(r"\.\d+$", "", name)  # pandas may dedupe dup headers
         if name in {"% of party vote", "total %"}:
             return True
         if "%" in name and "party vote" in name:
             return True
         return False
 
-    nonparty_cols = cols[1:]
-    count_cols = [c for c in nonparty_cols if not _is_percent_col(c)]
+    nonparty_cols = [c for c in df.columns[1:] if not _is_percent_col(c)]
+    # Keep original titles for count columns (including Informals / Party Only)
+    # Candidate count columns are everything after Party Vote Totals.
+    count_cols_after_total = [c for c in nonparty_cols if c != party_total_col]
 
-    # count_cols includes Party Vote Totals (counts) + candidate/informal/party-only count columns.
-    after_total = [c for c in count_cols if c != party_total_col]
+    keep_cols = ["Party", party_total_col] + count_cols_after_total
+    df = df[keep_cols].copy()
 
-    # Keep original column titles in the resulting split vote file.
-    # (Do not rename using candidate_order.)
-    candidate_cols = list(after_total)
+    # Standardise bookkeeping columns
+    df = df.rename(columns={party_total_col: "Total Party Votes"})
+    count_cols = count_cols_after_total[:]  # preserve original titles
 
-    # Keep only Party + counts
-    keep_cols = ["Party", party_total_col] + candidate_cols
-    keep_cols = [c for c in keep_cols if c in df.columns]
-    df = df[keep_cols].copy().fillna(0.0)
-
-    # Build QA_total column from atomic_party_totals.
-    # 2002 split sheets often use long party names while atomic totals use abbreviations.
+    # Optional: decorate party row labels with candidate names from roster
     def norm_party(s: str) -> str:
         s = str(s).strip().casefold()
         s = re.sub(r"[^a-z0-9]+", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
+    # Map split party label -> atomic key (best-effort), then -> candidate name(s)
     explicit = {
         "act new zealand": "ACT",
         "new zealand first party": "NZ First",
@@ -197,199 +185,284 @@ def process_2002_split_sheet_df_to_endstate(
     def map_party_label(p: object) -> str:
         p0 = "" if pd.isna(p) else str(p).strip()
         n = norm_party(p0)
-        if n in explicit and explicit[n] in atomic_party_totals:
+        # direct explicit map
+        if n in explicit:
             return explicit[n]
-        for k, target in [
-            ("act", "ACT"),
-            ("labour", "Labour Party"),
-            ("national", "National Party"),
-            ("green", "Green Party"),
-            ("united future", "United Future"),
-            ("alliance", "Alliance"),
-            ("legalise cannabis", "Legalise Cannabis"),
-            ("progressive", "Progressive Coalition"),
-            ("new zealand first", "NZ First"),
-            ("one nz", "OneNZ Party"),
-            ("outdoor", "Outdoor Rec. NZ"),
-            ("christian heritage", "Christian Heritage"),
-            ("mana maori", "Mana Maori"),
-            ("nmp", "NMP"),
-        ]:
-            if k in n and target in atomic_party_totals:
-                return target
-        # If already an atomic label, keep it
-        if p0 in atomic_party_totals:
-            return p0
+        # try exact match against atomic party keys
+        for k in atomic_party_totals.keys():
+            if norm_party(k) == n:
+                return k
+        # substring match (conservative)
+        for k in atomic_party_totals.keys():
+            nk = norm_party(k)
+            if nk and (nk in n or n in nk):
+                return k
         return p0
 
-    # Keep the split sheet party label for display/output, but map to atomic party labels for QA lookups.
-    df['_Party_display'] = df['Party'].apply(lambda x: '' if pd.isna(x) else str(x).strip())
-    df['_Party_key'] = df['_Party_display'].apply(map_party_label)
-    df['QA_Total_Party_Votes_from_atomic_party'] = df['_Party_key'].apply(lambda p: float(atomic_party_totals.get(str(p), 0.0)))
-
-    # In the party rows, append the electorate candidate name(s) from the candidate roster so the row
-    # label has the form: "Party Name (Candidate Name)" using the *original* party label from the split sheet.
     if party_to_candidate_names:
-        def _decorate_party_row(p_display: str, p_key: str) -> str:
-            cn = party_to_candidate_names.get(str(p_key).strip())
-            return f"{p_display} ({cn})" if cn else p_display
-        df['Party'] = [
-            _decorate_party_row(d, k) for d, k in zip(df['_Party_display'].tolist(), df['_Party_key'].tolist())
-        ]
-    else:
-        df['Party'] = df['_Party_display']
+        decorated = []
+        for p in df["Party"].tolist():
+            p_txt = "" if pd.isna(p) else str(p).strip()
+            if p_txt.casefold() in {"party vote totals"}:
+                decorated.append(p_txt)
+                continue
+            atomic_key = map_party_label(p_txt)
+            cand_names = party_to_candidate_names.get(atomic_key) or party_to_candidate_names.get(p_txt)
+            if cand_names:
+                decorated.append(f"{p_txt} ({cand_names})")
+            else:
+                decorated.append(p_txt)
+        df["Party"] = decorated
 
-    # We no longer need helper columns in output.
-    df = df.drop(columns=['_Party_display', '_Party_key'], errors='ignore')
+    # Compute per-row Sum_from_split_vote_counts = sum of count columns (candidates + Informals + Party Only)
+    for c in count_cols + ["Total Party Votes"]:
+        if c in df.columns:
+            df[c] = df[c].fillna(0.0)
+    df["Sum_from_split_vote_counts"] = df[count_cols].sum(axis=1)
+    # QA party totals per row (from atomic party votes CSV), and per-row consistency across:
+    #   Sum_from_split_vote_counts, Total Party Votes, QA_Total_Party_Votes_from_atomic_party
+    qa_party_col = "QA_Total_Party_Votes_from_atomic_party"
+    qa_vals: List[float] = []
+    for p in df["Party"].tolist():
+        p_txt = "" if pd.isna(p) else str(p).strip()
+        p_base = p_txt.split(" (", 1)[0].strip() if " (" in p_txt else p_txt
+        p_norm = p_base.casefold()
+        if p_norm in {"informal votes", ""}:
+            qa_vals.append(float("nan"))
+            continue
+        if p_norm == "party vote totals":
+            qa_vals.append(float(sum(atomic_party_totals.values())) if atomic_party_totals else float("nan"))
+            continue
+        atomic_key = map_party_label(p_base)
+        v = atomic_party_totals.get(atomic_key)
+        qa_vals.append(float(v) if v is not None else float("nan"))
+    df[qa_party_col] = qa_vals
 
-    # Row sums and consistency
-    df["Sum_from_split_vote_counts"] = df[candidate_cols].sum(axis=1)
-    # Party Vote Totals column is the authoritative split per-row total.
-    df["Total Party Votes"] = df[party_total_col]
-    df["consistent"] = (df["Sum_from_split_vote_counts"] == df["Total Party Votes"]) & (
-        df["Sum_from_split_vote_counts"] == df["QA_Total_Party_Votes_from_atomic_party"]
-    )
+    def _eq3_or_error(a: float, b: float, c: float) -> object:
+        """Return True/False if comparable, else 'error'."""
+        if pd.isna(a) or pd.isna(b) or pd.isna(c):
+            return "error"
+        try:
+            return bool(float(a) == float(b) == float(c))
+        except Exception:
+            return "error"
 
-    # Reorder columns: Party, candidate_cols..., Sum_from..., Total Party Votes, QA..., consistent
-    df = df[["Party"] + candidate_cols + ["Sum_from_split_vote_counts", "Total Party Votes", "QA_Total_Party_Votes_from_atomic_party", "consistent"]]
+    # Per-row consistent flag (string 'error' when not computable):
+    #   Sum_from_split_vote_counts == Total Party Votes == QA_Total_Party_Votes_from_atomic_party
+    df["consistent"] = [
+        _eq3_or_error(a, b, c)
+        for a, b, c in zip(df["Sum_from_split_vote_counts"], df["Total Party Votes"], df[qa_party_col])
+    ]
 
-    # Reorder rows:
-    #  - party rows that have candidate mappings first (Party Name (Candidate))
-    #  - then remaining rows.
+    # Split out provided totals row if present (by label)
+
     party_norm = df["Party"].astype(str).str.strip()
-    is_party_vote_totals = party_norm.str.lower() == "party vote totals"
-    is_informal_votes = party_norm.str.lower() == "informal votes"
+    is_totals_row = party_norm.str.casefold() == "party vote totals"
+    df_main = df.loc[~is_totals_row].copy()
+    df_provided_totals = df.loc[is_totals_row].copy()
 
-    has_candidate = party_norm.str.contains(r"\(.+\)") & ~(is_party_vote_totals | is_informal_votes)
+    # Row order: rows that have appended candidate parentheses first
+    is_informal_votes = df_main["Party"].astype(str).str.strip().str.casefold() == "informal votes"
+    has_candidate = df_main["Party"].astype(str).str.contains(r"\(.+\)") & ~is_informal_votes
+    df_main["__has_candidate"] = has_candidate
+    df_main["__orig"] = range(len(df_main))
+    df_main = df_main.sort_values(by=["__has_candidate", "__orig"], ascending=[False, True]).drop(columns=["__has_candidate", "__orig"])
 
-    df_no_totals = df.loc[~is_party_vote_totals].copy()
-    df_totals_row = df.loc[is_party_vote_totals].copy()
+    # --- Summary rows
+    numeric_cols = count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col]
 
-    df_no_totals["__has_candidate"] = has_candidate.loc[~is_party_vote_totals].values
-    df_no_totals["__orig"] = range(len(df_no_totals))
-    df_no_totals = df_no_totals.sort_values(by=["__has_candidate", "__orig"], ascending=[False, True]).drop(columns=["__has_candidate", "__orig"])
+    # Sum_from_split_vote_counts summary row: sum of all rows above (df_main), column-wise.
+    sum_row = {"Party": "Sum_from_split_vote_counts"}
+    for c in numeric_cols:
+        sum_row[c] = float(df_main[c].sum(skipna=True))
 
-    # Bottom summary rows (we place Sum_from_split_vote_counts ABOVE the provided "Party vote totals" row).
-    # Compute sums using PARTY rows only (exclude "Informal Votes" and "Party vote totals").
-    # Sum_from_split_vote_counts summary row must sum *all rows above* (all non-totals rows).
-    df_for_sums = df_no_totals.copy()
+    # QA sums from candidate csv: populate candidate columns + Informals from atomic candidate totals.
+    # Candidate CSV column headers are usually WITHOUT party in parentheses.
+    qa_row = {"Party": "QA sums from the candidate csv"}
+    # Build a lookup from candidate-csv header -> total
+    cand_tot = atomic_candidate_totals or {}
 
-    sums = {"Party": "Sum_from_split_vote_counts"}
-    qa = {"Party": "QA sums from the candidate csv"}
+    def _norm_name(x: str) -> str:
+        x = str(x).strip()
+        x = re.sub(r"\s+", " ", x)
+        return x.casefold()
 
-    def _atomic_lookup(col: str) -> float:
-        if not atomic_candidate_totals:
+    # Precompute mapping split col -> candidate csv col (strip parenthetical)
+    split_to_cand = {}
+    for sc in count_cols:
+        base = str(sc)
+        base2 = base
+        if "(" in base and base.rstrip().endswith(")"):
+            base2 = base.rsplit("(", 1)[0].strip()
+        split_to_cand[sc] = base2
+
+    # Informals key in candidate totals can vary
+    informal_key = None
+    for k in list(cand_tot.keys()):
+        if _norm_name(k) in {"informal candidate votes", "informals", "informal"}:
+            informal_key = k
+            break
+
+    # Fill candidate columns
+    for sc in count_cols:
+        if _norm_name(sc).endswith("informals") or _norm_name(sc) in {"informals", "informal candidate votes"}:
+            if informal_key is not None:
+                qa_row[sc] = float(cand_tot.get(informal_key, float("nan")))
+            else:
+                qa_row[sc] = float("nan")
+            continue
+        if "party only" in _norm_name(sc):
+            qa_row[sc] = float("nan")  # derived below
+            continue
+
+        cc = split_to_cand.get(sc, sc)
+        # try exact
+        v = None
+        for ck in (cc, str(cc).strip(), " ".join(str(cc).split())):
+            if ck in cand_tot:
+                v = cand_tot[ck]
+                break
+        if v is None:
+            # try casefold match
+            for k, val in cand_tot.items():
+                if _norm_name(k) == _norm_name(cc):
+                    v = val
+                    break
+        qa_row[sc] = float(v) if v is not None and pd.notna(v) else float("nan")
+
+    # Compute Party Only for QA row if possible (needs total party votes sum)
+    total_party_votes_sum = float(sum(atomic_party_totals.values())) if atomic_party_totals else float("nan")
+
+    # Candidate sum + informal for QA
+    qa_candidate_sum = 0.0
+    for sc in count_cols:
+        nsc = _norm_name(sc)
+        if "party only" in nsc:
+            continue
+        v = qa_row.get(sc, float("nan"))
+        if pd.notna(v):
+            qa_candidate_sum += float(v)
+
+    if informal_key is not None and pd.notna(cand_tot.get(informal_key, float("nan"))):
+        # ensure informal included (already included if split has Informals col)
+        pass
+
+    if pd.notna(total_party_votes_sum):
+        party_only_val = total_party_votes_sum - qa_candidate_sum
+        # assign to any split column containing "party only"
+        for sc in count_cols:
+            if "party only" in _norm_name(sc):
+                qa_row[sc] = float(party_only_val)
+
+    # Fill bookkeeping totals
+    qa_row["Total Party Votes"] = total_party_votes_sum
+    qa_row[qa_party_col] = total_party_votes_sum
+    # Sum_from_split_vote_counts in QA row is sum of count cols (incl derived party only)
+    qa_row["Sum_from_split_vote_counts"] = float(sum(float(qa_row.get(sc, 0.0)) for sc in count_cols if pd.notna(qa_row.get(sc, float("nan")))))
+
+    # Consistent row (column-wise IFF checks + final corner check)
+    # We compute:
+    #   - Row-level 'consistent' values for all rows above (party rows + summary rows)
+    #   - Last row 'Consistent': per-column consistency of the three summary rows
+    #       (Sum_from_split_vote_counts row, Party vote totals row, QA sums from the candidate csv row)
+    #   - Final corner cell (Consistent row, consistent column):
+    #       TRUE  iff all row-level consistent values and all column-consistency values are TRUE
+    #       FALSE iff any of those values are FALSE
+    #       "error" if unable to compute any required value
+    compare_cols = count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col]
+
+    def _float_or_nan(x) -> float:
+        try:
+            if pd.isna(x):
+                return float("nan")
+            return float(x)
+        except Exception:
             return float("nan")
 
-    # Totals derived from atomic files (for QA row):
-    atomic_party_votes_sum = float(sum(atomic_party_totals.values())) if atomic_party_totals else float('nan')
-    # Informal candidate votes total (best-effort lookup from atomic_candidate_totals, if provided)
-    atomic_informal_candidate_total = float('nan')
-    if atomic_candidate_totals:
-        for k in ['Informals', 'Informal Candidate Votes', 'informals', 'informal candidate votes']:
-            if k in atomic_candidate_totals:
-                try:
-                    atomic_informal_candidate_total = float(atomic_candidate_totals[k])
-                except Exception:
-                    pass
-                break
+    def _eq_vals(vals: List[float]) -> object:
+        if any(pd.isna(v) for v in vals):
+            return "error"
+        try:
+            first = float(vals[0])
+            return bool(all(float(v) == first for v in vals[1:]))
+        except Exception:
+            return "error"
 
-    def _qa_value_for_col(col: str) -> float:
-        """Populate QA row values from the candidate CSV (plus derived Party Only if needed)."""
-        # For bookkeeping totals, use atomic party vote total (this is what split totals reconcile to).
-        if col in {'Sum_from_split_vote_counts', 'Total Party Votes'}:
-            return atomic_party_votes_sum
-        # Candidate totals (and Informals) come from candidate CSV totals.
-        v = _atomic_lookup(col)
-        if pd.notna(v):
-            return float(v)
-        name = str(col).strip().casefold()
-        # Derive Party Only from: total party votes - (sum candidates + informal candidate votes).
-        if 'party only' in name and pd.notna(atomic_party_votes_sum):
-            cand_sum = 0.0
-            if atomic_candidate_totals:
-                for ck, cv in atomic_candidate_totals.items():
-                    if ck in {'Informals', 'Informal Candidate Votes'}:
-                        continue
-                    # skip non-candidate meta keys
-                    if ck.startswith('__'):
-                        continue
-                    try:
-                        cand_sum += float(cv)
-                    except Exception:
-                        continue
-            inf = 0.0 if pd.isna(atomic_informal_candidate_total) else float(atomic_informal_candidate_total)
-            return float(atomic_party_votes_sum - (cand_sum + inf))
-        return float('nan')
-        if col in atomic_candidate_totals:
-            return float(atomic_candidate_totals[col])
-        k = str(col).strip()
-        if k in atomic_candidate_totals:
-            return float(atomic_candidate_totals[k])
-        k2 = " ".join(k.split())
-        if k2 in atomic_candidate_totals:
-            return float(atomic_candidate_totals[k2])
-        k3 = k.lstrip()
-        if k3 in atomic_candidate_totals:
-            return float(atomic_candidate_totals[k3])
-        return float("nan")
-
-    summary_cols = candidate_cols + ["Sum_from_split_vote_counts", "Total Party Votes", "QA_Total_Party_Votes_from_atomic_party"]
-    for c in summary_cols:
-        if c == "QA_Total_Party_Votes_from_atomic_party":
-            sums[c] = float(df_for_sums[c].sum(skipna=True))
-            qa[c] = float("nan")
-            continue
-        sums[c] = float(df_for_sums[c].sum(skipna=True))
-        qa[c] = _qa_value_for_col(c)
-
-    sums["consistent"] = True
-    qa["consistent"] = True
-
-    compare_cols = list(candidate_cols) + ["Sum_from_split_vote_counts", "Total Party Votes"]
-    if " Informals" in df.columns and " Informals" not in compare_cols:
-        compare_cols.insert(len(candidate_cols), " Informals")
-    if " Party Only" in df.columns and " Party Only" not in compare_cols:
-        compare_cols.insert(len(candidate_cols) + 1, " Party Only")
-
-    sums_vec = [sums.get(c, float("nan")) for c in compare_cols]
-    qa_vec = [qa.get(c, float("nan")) for c in compare_cols]
-    if not df_totals_row.empty:
-        tot_row = df_totals_row.iloc[0].to_dict()
-        tot_vec = [float(tot_row.get(c, float("nan"))) if pd.notna(tot_row.get(c, float("nan"))) else float("nan") for c in compare_cols]
-    else:
-        tot_vec = [float("nan") for _ in compare_cols]
-
-    def _vec_equal(a, b) -> bool:
-        for x, y in zip(a, b):
-            if pd.isna(x) and pd.isna(y):
-                continue
-            if pd.isna(x) != pd.isna(y):
-                return False
-            if float(x) != float(y):
-                return False
+    def _and_truth(values: List[object]) -> object:
+        # Three-valued AND over True/False/"error"
+        has_error = any((v == "error") or pd.isna(v) for v in values)
+        if has_error:
+            return "error"
+        if any(v is False for v in values):
+            return False
         return True
 
-    consistent_bool = _vec_equal(sums_vec, tot_vec) and _vec_equal(sums_vec, qa_vec)
+    def _row_consistent_from_dict(d: dict) -> object:
+        a = _float_or_nan(d.get("Sum_from_split_vote_counts"))
+        b = _float_or_nan(d.get("Total Party Votes"))
+        c = _float_or_nan(d.get(qa_party_col))
+        return _eq_vals([a, b, c])
 
-    consistent_row = {"Party": "Consistent"}
-    for c in df.columns:
-        if c == "Party":
-            continue
-        if c == "consistent":
-            consistent_row[c] = bool(consistent_bool)
+    # Build provided totals row dict (if present)
+    provided_row_dict: Optional[dict] = None
+    if not df_provided_totals.empty:
+        provided_row_dict = df_provided_totals.iloc[0].to_dict()
+
+    # Attach row-level consistent values to summary rows
+    sum_row["consistent"] = _row_consistent_from_dict(sum_row)
+    if provided_row_dict is not None:
+        provided_row_dict["consistent"] = _row_consistent_from_dict(provided_row_dict)
+    qa_row["consistent"] = _row_consistent_from_dict(qa_row)
+
+    # Column-wise consistency (last row) for each compare column
+    consistent_row: Dict[str, object] = {"Party": "Consistent"}
+    col_consistency_values: List[object] = []
+
+    for c in compare_cols:
+        if provided_row_dict is None:
+            v = "error"
         else:
-            consistent_row[c] = float("nan")
+            v = _eq_vals([
+                _float_or_nan(sum_row.get(c)),
+                _float_or_nan(provided_row_dict.get(c)),
+                _float_or_nan(qa_row.get(c)),
+            ])
+        consistent_row[c] = v
+        col_consistency_values.append(v)
 
-    out = pd.concat([
-        df_no_totals,
-        pd.DataFrame([sums]),
-        df_totals_row,
-        pd.DataFrame([qa, consistent_row]),
-    ], ignore_index=True)
+    # Final corner cell: AND(all row-level consistent values above, all column-consistency values)
+    row_consistency_values: List[object] = []
+    if "consistent" in df_main.columns:
+        row_consistency_values.extend(df_main["consistent"].tolist())
+    row_consistency_values.append(sum_row["consistent"])
+    row_consistency_values.append(provided_row_dict.get("consistent") if provided_row_dict is not None else "error")
+    row_consistency_values.append(qa_row["consistent"])
 
-    out2 = _format_df_numbers_for_csv(out)
-    out2.to_csv(out_csv, index=False, encoding="utf-8")
+    corner = _and_truth(row_consistency_values + col_consistency_values)
+    consistent_row["consistent"] = corner
+
+    # Assemble final table
+    out_rows: List[pd.DataFrame] = [df_main]
+
+    out_rows.append(pd.DataFrame([sum_row], columns=["Party"] + count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col, "consistent"]))
+
+    if provided_row_dict is not None:
+        out_rows.append(pd.DataFrame([provided_row_dict], columns=["Party"] + count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col, "consistent"]))
+
+    out_rows.append(pd.DataFrame([qa_row], columns=["Party"] + count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col, "consistent"]))
+
+    out_rows.append(pd.DataFrame([consistent_row], columns=["Party"] + count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col, "consistent"]))
+
+    out_df = pd.concat(out_rows, ignore_index=True, sort=False)
+
+    # Column order: Party + count cols + bookkeeping + consistent
+    out_df = out_df[["Party"] + count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col, "consistent"]]
+
+    # Format numbers but keep 'error' strings in place
+    out_df = _format_df_numbers_for_csv(out_df)
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(out_csv, index=False, encoding="utf-8")
 
 
 def process_2002_split_xls_to_endstate(
