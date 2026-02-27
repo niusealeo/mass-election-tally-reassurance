@@ -5,8 +5,8 @@ import pandas as pd
 from pathlib import Path
 from typing import Optional
 
-from .checksums import safe_mkdir
-from .sainte_lague import base_name
+from tally_assure.libs.fs import safe_mkdir
+from tally_assure.libs.sainte_lague import base_name
 
 def solve_sliding_puzzle(start_path: Path, split_path: Path, candidate_totals: pd.Series,
                          out_prefix: Path) -> None:

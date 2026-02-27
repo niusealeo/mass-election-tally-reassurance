@@ -8,7 +8,7 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 
-from .checksums import safe_mkdir
+from tally_assure.libs.fs import safe_mkdir
 
 def base_name(col: str) -> str:
     return re.sub(r"\s*\(.*\)\s*$", "", str(col)).strip()
