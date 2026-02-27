@@ -206,6 +206,7 @@ def run_all(
             split_endstate_path = out_elec / f"{job.electorateFolder}_split_votes_endstate.csv"
             atomic_party_totals = _read_atomic_party_totals(job.party_path)
             candidate_order = None
+            atomic_cand_totals = None
             if job.cand_path and job.cand_path.exists():
                 # Use the atomic candidate totals columns (ordered) to label split columns.
                 atomic_cand_totals = _read_atomic_candidate_totals(job.cand_path)
@@ -232,6 +233,7 @@ def run_all(
                 candidate_order,
                 party_to_candidate_names,
                 split_endstate_path,
+                atomic_candidate_totals=atomic_cand_totals,
             )
             split_detail = checksum_splitvote_endstate_2002(split_endstate_path, job.cand_path, job.party_path)
 

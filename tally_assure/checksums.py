@@ -488,10 +488,20 @@ def _read_atomic_candidate_totals(candidate_csv: Path) -> Dict[str, float]:
     trow = find_totals_row(df)
     if trow is None:
         return {}
-    cand_cols, _, _ = candidate_numeric_cols(df)
-    for c in cand_cols:
+    cand_cols, total_valid_col, informal_col = candidate_numeric_cols(df)
+    for c in cand_cols + [total_valid_col, informal_col]:
         df[c] = _to_num(df[c])
-    return {str(c).strip(): float(df.loc[trow, c]) if pd.notna(df.loc[trow, c]) else 0.0 for c in cand_cols}
+    out = {str(c).strip(): float(df.loc[trow, c]) if pd.notna(df.loc[trow, c]) else 0.0 for c in cand_cols}
+    # Provide informal candidate votes total under common keys so the split QA row can populate Informals.
+    informal_total = float(df.loc[trow, informal_col]) if pd.notna(df.loc[trow, informal_col]) else 0.0
+    out[str(informal_col).strip()] = informal_total
+    out['Informals'] = informal_total
+    out['Informal Candidate Votes'] = informal_total
+    # Total valid candidate votes can also be useful for diagnostics.
+    total_valid = float(df.loc[trow, total_valid_col]) if pd.notna(df.loc[trow, total_valid_col]) else 0.0
+    out[str(total_valid_col).strip()] = total_valid
+    out['Total valid candidate votes'] = total_valid
+    return out
 
 
 def _read_atomic_party_totals(party_csv: Path) -> Dict[str, float]:
@@ -510,101 +520,6 @@ def checksum_splitvote_endstate_2002(
     candidate_csv: Path,
     party_csv: Path,
 ) -> Dict[str, Any]:
-    """Checks the endstate splitvote matrix against row/col totals and atomic totals."""
-    mat = pd.read_csv(split_endstate_csv)
-
-    required = {"Party", "Sum_from_split_vote_counts", "Total Party Votes", "QA_Total_Party_Votes_from_atomic_party", "consistent"}
-    if not required.issubset(set(mat.columns)):
-        return {
-            "file": str(split_endstate_csv),
-            "error": f"Missing required columns: {sorted(required - set(mat.columns))}",
-            "checks": {},
-        }
-
-    # Separate main rows from bottom summary rows
-    def is_summary_party(p: str) -> bool:
-        p = str(p).strip().lower()
-        return p in {"sum_from_split_vote_counts", "provided_party_vote_totals_row", "residual_deviation"}
-
-    main = mat[~mat["Party"].astype(str).apply(is_summary_party)].copy()
-
-    # Candidate/informal/partyonly columns are everything except the final 4 bookkeeping cols.
-    bookkeeping = ["Sum_from_split_vote_counts", "Total Party Votes", "QA_Total_Party_Votes_from_atomic_party", "consistent"]
-    cand_cols = [c for c in mat.columns if c not in ["Party"] + bookkeeping]
-
-    for c in cand_cols + bookkeeping[0:3]:
-        main.loc[:, c] = pd.to_numeric(main[c], errors="coerce").fillna(0.0)
-
-    # Row consistency: record failures (should match bool column but recompute here)
-    row_fail = []
-    for _, r in main.iterrows():
-        party = str(r["Party"]).strip()
-        qa_sum = float(r[cand_cols].sum())
-        split_total = float(r["Total Party Votes"])
-        atomic_total = float(r["QA_Total_Party_Votes_from_atomic_party"])
-        ok = (qa_sum == split_total) and (qa_sum == atomic_total)
-        if not ok:
-            row_fail.append({
-                "party": party,
-                "qa_sum_of_row": qa_sum,
-                "split_total_party_votes": split_total,
-                "atomic_party_total": atomic_total,
-            })
-
-    # Column sums vs atomic candidate totals
-    atomic_cands = _read_atomic_candidate_totals(candidate_csv)
-    col_fail = []
-    col_pass = []
-    for c in cand_cols:
-        key = str(c).strip()
-        if key not in atomic_cands:
-            continue
-        qa = float(main[c].sum())
-        official = float(atomic_cands[key])
-        if qa == official:
-            col_pass.append({"key": key})
-        else:
-            col_fail.append(fail_kv(key, qa, official))
-
-    # Party totals vs atomic party totals
-    atomic_party = _read_atomic_party_totals(party_csv)
-    party_fail = []
-    party_pass = []
-    for _, r in main.iterrows():
-        party = str(r["Party"]).strip()
-        if party not in atomic_party:
-            continue
-        qa = float(r["Total Party Votes"])
-        official = float(atomic_party[party])
-        if qa == official:
-            party_pass.append({"party": party})
-        else:
-            party_fail.append(fail_kv(party, qa, official))
-
-    # Provided totals row vs QA totals row (if present in file)
-    def find_row(label: str) -> Optional[pd.Series]:
-        hit = mat[mat["Party"].astype(str).str.strip().str.lower() == label.lower()]
-        return hit.iloc[0] if len(hit) else None
-
-    qa_row = find_row("Sum_from_split_vote_counts")
-    prov_row = find_row("Provided_party_vote_totals_row")
-    totals_row_fail = []
-    totals_row_pass = []
-    if qa_row is not None and prov_row is not None:
-        for c in cand_cols + ["Total Party Votes"]:
-            qa = float(pd.to_numeric(qa_row[c], errors="coerce") or 0.0)
-            official = float(pd.to_numeric(prov_row[c], errors="coerce") or 0.0)
-            if qa == official:
-                totals_row_pass.append({"key": c})
-            else:
-                totals_row_fail.append(fail_kv(c, qa, official))
-
-    return {
-        "file": str(split_endstate_csv),
-        "checks": {
-            "splitvote_row_consistency_bool": {"passed": [], "failed": row_fail},
-            "splitvote_candidate_column_sums_vs_atomic_candidate_totals": {"passed": col_pass, "failed": col_fail},
-            "splitvote_party_totals_vs_atomic_party_totals": {"passed": party_pass, "failed": party_fail},
-            "splitvote_provided_totals_row_vs_qa_totals_row": {"passed": totals_row_pass, "failed": totals_row_fail},
-        },
-    }
+    """2002-era splitvote endstate checks (delegated to tally_assure.eras.era_2002)."""
+    from .eras.era_2002.checks_2002 import checksum_splitvote_endstate_2002 as _impl
+    return _impl(split_endstate_csv=split_endstate_csv, candidate_csv=candidate_csv, party_csv=party_csv)
