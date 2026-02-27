@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from .libs.paths import common_parent, relativize_detail
+from .libs.paths import common_parent, rel_to_common, relativize_detail
 
 from .checksums import (
     now_stamps,
@@ -22,6 +22,11 @@ from .checksums import (
     port_party_roster_csv,
     _read_atomic_candidate_totals,
     _read_atomic_party_totals,
+)
+
+from .eras.era_2002.splitvote_2002 import (
+    compute_party_meta_from_party_csv,
+    compute_informal_candidate_votes_total,
 )
 from .discovery import ElectorateJob, build_jobs
 from .porting import process_2002_split_xls_to_endstate
@@ -191,13 +196,16 @@ def run_all(
         split_endstate_path = None
         split_detail = None
         if job.year == 2002 and job.split_path and job.split_path.exists() and job.party_path and job.party_path.exists():
-            split_endstate_path = out_elec / f"{job.electorateFolder}_twintick_approvalballot_solution.csv"
+            split_endstate_path = out_elec / f"{job.electorateFolder}_twintiki_approvalballot_solution.csv"
             atomic_party_totals = _read_atomic_party_totals(job.party_path)
+            party_meta = compute_party_meta_from_party_csv(job.party_path)
             candidate_order = None
             atomic_cand_totals = None
             if job.cand_path and job.cand_path.exists():
                 # Use the atomic candidate totals columns (ordered) to label split columns.
                 atomic_cand_totals = _read_atomic_candidate_totals(job.cand_path)
+                # Add QA informal candidate votes total (computed from rows) for QA matrix row population
+                atomic_cand_totals['Informal Candidate Votes'] = float(compute_informal_candidate_votes_total(job.cand_path))
                 candidate_order = [k for k in atomic_cand_totals.keys() if str(k).strip()]
 
                 # Prefer candidate totals from the candidate roster (for QA row), if available.
@@ -234,17 +242,18 @@ def run_all(
                     party_to_candidate_names = None
 
             process_2002_split_xls_to_endstate(
-                job.split_path,
-                atomic_party_totals,
-                candidate_order,
-                party_to_candidate_names,
-                split_endstate_path,
+                xls_path=job.split_path,
+                atomic_party_totals=atomic_party_totals,
+                candidate_order=candidate_order,
+                out_csv=split_endstate_path,
                 atomic_candidate_totals=atomic_cand_totals,
+                party_meta=party_meta,
+                party_to_candidate_names=party_to_candidate_names,
             )
             split_detail = checksum_splitvote_endstate_2002(split_endstate_path, job.cand_path, job.party_path)
 
         # Write per-electorate checksum jsons
-        common_parent = common_parent([job.split_path, job.cand_path, job.party_path, split_endstate_path, out_elec])
+        common_root = common_parent([job.split_path, job.cand_path, job.party_path, split_endstate_path, out_elec])
         elec_meta = {
             "termKey": termKey,
             "year": job.year,
@@ -254,10 +263,10 @@ def run_all(
             "alphabeticNumber": job.alphabeticNumber,
             "timestamps": {"utc": utc_s, "local": local_s},
             "paths": {
-                "split": _rel_to_common(job.split_path, common_parent),
-                "candidate": _rel_to_common(job.cand_path, common_parent),
-                "party": _rel_to_common(job.party_path, common_parent),
-                "split_endstate": _rel_to_common(split_endstate_path, common_parent) if split_endstate_path else None,
+                "split": rel_to_common(job.split_path, common_root),
+                "candidate": rel_to_common(job.cand_path, common_root),
+                "party": rel_to_common(job.party_path, common_root),
+                "split_endstate": rel_to_common(split_endstate_path, common_root) if split_endstate_path else None,
             },
         }
 

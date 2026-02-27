@@ -121,7 +121,9 @@ party_csv :Path ,
         return hit .iloc [0 ]if len (hit )else None 
 
     sum_row =find_row ("Sum_from_split_vote_counts")
-    prov_row =find_row ("Provided candidate split vote totals")or find_row ("Party vote totals")
+    prov_row = find_row("Provided candidate split vote totals")
+    if prov_row is None:
+        prov_row = find_row("Party vote totals")
     totals_row_fail =[]
     totals_row_pass =[]
     if sum_row is not None and prov_row is not None :

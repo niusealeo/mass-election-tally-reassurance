@@ -71,14 +71,15 @@ def _coerce_num_series (s :pd .Series )->pd .Series :
         s2 =s 
     return pd .to_numeric (s2 ,errors ="coerce")
 
-def process_2002_split_sheet_df_to_endstate (
-df :pd .DataFrame ,
-atomic_party_totals :Dict [str ,float ],
-candidate_order :Optional [List [str ]],
-out_csv :Path ,
-atomic_candidate_totals :Optional [Dict [str ,float ]],
-party_to_candidate_names :Optional [Dict [str ,str ]]=None ,
-)->None :
+def process_2002_split_sheet_df_to_endstate(
+    df: pd.DataFrame,
+    atomic_party_totals: Dict[str, float],
+    candidate_order: Optional[List[str]],
+    out_csv: Path,
+    atomic_candidate_totals: Optional[Dict[str, float]],
+    party_meta: Optional[Dict[str, float]] = None,
+    party_to_candidate_names: Optional[Dict[str, str]] = None,
+) -> None:
     """Convert 2002-style split votes sheet0 dataframe to our endstate CSV format.
 
     This is *deterministic* for the known 2002 sheet layout:
@@ -228,10 +229,10 @@ party_to_candidate_names :Optional [Dict [str ,str ]]=None ,
         p_base =p_txt .split (" (",1 )[0 ].strip ()if " ("in p_txt else p_txt 
         p_norm =p_base .casefold ()
         if p_norm in {"informal votes",""}:
-            qa_vals .append (float ("nan"))
+            qa_vals .append (float (party_meta .get ('informal_party_votes_total')) if party_meta and party_meta.get('informal_party_votes_total') is not None else float ('nan'))
             continue 
         if p_norm in {"party vote totals","provided candidate split vote totals"}:
-            qa_vals .append (float (sum (atomic_party_totals .values ()))if atomic_party_totals else float ("nan"))
+            qa_vals .append (float (party_meta .get ('total_party_votes_incl_informal')) if party_meta and party_meta.get('total_party_votes_incl_informal') is not None else (float (sum (atomic_party_totals .values ()))if atomic_party_totals else float ('nan')))
             continue 
         atomic_key =map_party_label (p_base )
         v =atomic_party_totals .get (atomic_key )
@@ -331,7 +332,7 @@ party_to_candidate_names :Optional [Dict [str ,str ]]=None ,
         qa_row [sc ]=float (v )if v is not None and pd .notna (v )else float ("nan")
 
         # Compute Party Only for QA row if possible (needs total party votes sum)
-    total_party_votes_sum =float (sum (atomic_party_totals .values ()))if atomic_party_totals else float ("nan")
+    total_party_votes_sum =float (party_meta .get ('total_party_votes_incl_informal')) if party_meta and party_meta.get('total_party_votes_incl_informal') is not None else (float (sum (atomic_party_totals .values ()))if atomic_party_totals else float ('nan'))
 
     # Candidate sum + informal for QA
     qa_candidate_sum =0 
@@ -347,8 +348,8 @@ party_to_candidate_names :Optional [Dict [str ,str ]]=None ,
     # ensure informal included (already included if split has Informals col)
         pass 
 
-    if pd .notna (total_party_votes_sum ):
-        party_only_val =total_party_votes_sum -qa_candidate_sum 
+    if party_meta and party_meta.get('party_only_total') is not None :
+        party_only_val =float (party_meta .get ('party_only_total'))
         # assign to any split column containing "party only"
         for sc in count_cols :
             if "party only"in _norm_name (sc ):
@@ -466,22 +467,76 @@ party_to_candidate_names :Optional [Dict [str ,str ]]=None ,
     out_df .to_csv (out_csv ,index =False ,encoding ="utf-8")
 
 
-def process_2002_split_xls_to_endstate (
-xls_path :Path ,
-atomic_party_totals :Dict [str ,float ],
-candidate_order :Optional [List [str ]],
-party_to_candidate_names :Optional [Dict [str ,str ]],
-out_csv :Path ,
-atomic_candidate_totals :Optional [Dict [str ,float ]]=None ,
-)->None :
-    df =read_xls_sheet0 (xls_path )
-    process_2002_split_sheet_df_to_endstate (
-    df ,
-    atomic_party_totals ,
-    candidate_order ,
-    party_to_candidate_names =party_to_candidate_names ,
-    out_csv =out_csv ,
-    atomic_candidate_totals =atomic_candidate_totals ,
+def process_2002_split_xls_to_endstate(
+    xls_path: Path,
+    atomic_party_totals: Dict[str, float],
+    candidate_order: Optional[List[str]],
+    out_csv: Path,
+    atomic_candidate_totals: Optional[Dict[str, float]],
+    party_meta: Optional[Dict[str, float]] = None,
+    party_to_candidate_names: Optional[Dict[str, str]] = None,
+) -> None:
+    df = read_xls_sheet0(xls_path)
+    process_2002_split_sheet_df_to_endstate(
+        df=df,
+        atomic_party_totals=atomic_party_totals,
+        candidate_order=candidate_order,
+        out_csv=out_csv,
+        atomic_candidate_totals=atomic_candidate_totals,
+        party_meta=party_meta,
+        party_to_candidate_names=party_to_candidate_names,
     )
 
 
+
+# --- Era-2002 helpers (remain inside era directory)
+
+def compute_party_meta_from_party_csv(party_csv: Path) -> Dict[str, float]:
+    """Compute QA meta totals from the 2002-era party votes CSV (row-sums, not provided totals row).
+
+    Returns:
+      - informal_party_votes_total: sum of 'Informal Party Votes' across polling-place rows
+      - party_only_total: Total Valid Party Votes + Informal Party Votes from the 'Special Votes Allowed for Party Only' row
+      - total_party_votes_incl_informal: sum(party valid totals) + informal_party_votes_total
+    """
+    df = pd.read_csv(party_csv, skiprows=2, encoding="latin-1")
+    # totals row is where column 1 contains 'total'
+    col1 = df.columns[1]
+    s = df[col1].astype(str).str.strip().str.casefold()
+    hits = df.index[s.str.contains("total", na=False)]
+    trow = int(hits.max()) if len(hits) else len(df)
+    rows = df.iloc[:trow].copy()
+
+    # identify party columns (exclude metadata + trailing totals columns)
+    party_cols = [c for c in df.columns[2:] if c not in ["Total Valid Party Votes", "Informal Party Votes"]]
+
+    party_vals = rows[party_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    party_valid_total = float(party_vals.sum().sum())
+
+    informal_party_total = float(pd.to_numeric(rows.get("Informal Party Votes"), errors="coerce").fillna(0).sum())
+
+    # Party-only comes from the explicit row
+    party_only_total = float("nan")
+    mask = rows[col1].astype(str).str.contains("Special Votes Allowed for Party Only", case=False, na=False)
+    if mask.any():
+        r = rows.loc[mask].iloc[0]
+        pv = float(pd.to_numeric(r.get("Total Valid Party Votes"), errors="coerce") or 0)
+        pi = float(pd.to_numeric(r.get("Informal Party Votes"), errors="coerce") or 0)
+        party_only_total = pv + pi
+
+    return {
+        "informal_party_votes_total": informal_party_total,
+        "party_only_total": party_only_total,
+        "total_party_votes_incl_informal": party_valid_total + informal_party_total,
+    }
+
+
+def compute_informal_candidate_votes_total(candidate_csv: Path) -> float:
+    """Compute QA informal candidate votes total from polling-place rows (not provided totals row)."""
+    df = pd.read_csv(candidate_csv, skiprows=2, encoding="latin-1")
+    col1 = df.columns[1]
+    s = df[col1].astype(str).str.strip().str.casefold()
+    hits = df.index[s.str.contains("total", na=False)]
+    trow = int(hits.max()) if len(hits) else len(df)
+    rows = df.iloc[:trow].copy()
+    return float(pd.to_numeric(rows.get("Informal Candidate Votes"), errors="coerce").fillna(0).sum())
