@@ -95,6 +95,33 @@ def _to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s2, errors="coerce")
 
 
+def _strip_trailing_zeros(v):
+    """For CSV writing: remove meaningless trailing zeros.
+
+    Examples:
+      10.0 -> 10
+      10.50 -> 10.5
+      0.333300000 -> 0.3333
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return v
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        if float(v).is_integer():
+            return int(v)
+        return f"{v:.12f}".rstrip("0").rstrip(".")
+    return v
+
+
+def _format_df_numbers_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if pd.api.types.is_numeric_dtype(out[c]):
+            out[c] = out[c].apply(_strip_trailing_zeros)
+    return out
+
+
 def location_pair(df: pd.DataFrame, i: int) -> List[str]:
     """A size-2 array from the first two columns. No row index."""
     v0 = df.iloc[i, 0] if df.shape[1] >= 1 else ""
@@ -252,14 +279,14 @@ def port_candidate_roster_csv(candidate_csv: Path, out_csv: Path) -> None:
     df = read_csv_atomic(candidate_csv)
     trow = find_totals_row(df)
     roster = extract_candidate_roster(df, trow)
-    roster.to_csv(out_csv, index=False, encoding="utf-8")
+    _format_df_numbers_for_csv(roster).to_csv(out_csv, index=False, encoding="utf-8")
 
 
 def port_party_roster_csv(party_csv: Path, out_csv: Path) -> None:
     df = read_csv_atomic(party_csv)
     trow = find_totals_row(df)
     roster = extract_party_roster(df, trow)
-    roster.to_csv(out_csv, index=False, encoding="utf-8")
+    _format_df_numbers_for_csv(roster).to_csv(out_csv, index=False, encoding="utf-8")
 
 
 # ---------------- detailed atomic checksums ----------------

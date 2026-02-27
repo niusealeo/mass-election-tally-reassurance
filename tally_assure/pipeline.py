@@ -6,6 +6,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
+
 from .checksums import (
     now_stamps,
     safe_mkdir,
@@ -208,7 +210,29 @@ def run_all(
                 # Use the atomic candidate totals columns (ordered) to label split columns.
                 atomic_cand_totals = _read_atomic_candidate_totals(job.cand_path)
                 candidate_order = [k for k in atomic_cand_totals.keys() if str(k).strip()]
-            process_2002_split_xls_to_endstate(job.split_path, atomic_party_totals, candidate_order, split_endstate_path)
+            # Build party->candidate mapping for row label decoration in split endstate.
+            party_to_candidate_names = None
+            cand_roster_path = out_elec / f"{job.electorateFolder}_candidate_roster.csv"
+            if cand_roster_path.exists():
+                try:
+                    rdf = pd.read_csv(cand_roster_path, encoding="utf-8")
+                    if "party" in rdf.columns and "candidate" in rdf.columns:
+                        party_to_candidate_names = {}
+                        for party, g in rdf.groupby("party"):
+                            names = [str(x).strip() for x in g["candidate"].tolist() if str(x).strip()]
+                            if names:
+                                # If multiple candidates exist for a party, join them deterministically.
+                                party_to_candidate_names[str(party).strip()] = "; ".join(names)
+                except Exception:
+                    party_to_candidate_names = None
+
+            process_2002_split_xls_to_endstate(
+                job.split_path,
+                atomic_party_totals,
+                candidate_order,
+                party_to_candidate_names,
+                split_endstate_path,
+            )
             split_detail = checksum_splitvote_endstate_2002(split_endstate_path, job.cand_path, job.party_path)
 
         # Write per-electorate checksum jsons

@@ -16,11 +16,30 @@ def _strip_trailing_dot_zero(v):
     return v
 
 
+def _strip_trailing_zeros(v):
+    """For CSV writing:
+
+    - 123.0 -> 123
+    - 123.5000 -> 123.5
+    - keep decimal places only if they are non-zero
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return v
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        if float(v).is_integer():
+            return int(v)
+        # Use fixed precision then trim; keep as string to avoid binary float artifacts.
+        return f"{v:.12f}".rstrip("0").rstrip(".")
+    return v
+
+
 def _format_df_numbers_for_csv(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in out.columns:
         if pd.api.types.is_numeric_dtype(out[c]):
-            out[c] = out[c].apply(_strip_trailing_dot_zero)
+            out[c] = out[c].apply(_strip_trailing_zeros)
     return out
 
 
@@ -50,6 +69,7 @@ def process_2002_split_sheet_df_to_endstate(
     atomic_party_totals: Dict[str, float],
     candidate_order: Optional[List[str]],
     out_csv: Path,
+    party_to_candidate_names: Optional[Dict[str, str]] = None,
 ) -> None:
     """Convert 2002-style split votes sheet0 dataframe to our endstate CSV format.
 
@@ -102,6 +122,9 @@ def process_2002_split_sheet_df_to_endstate(
     if party_col is None:
         party_col = df.columns[0]
     df = df.rename(columns={party_col: "Party"})
+
+    # Note: we decorate the party row labels *after* normalising party labels,
+    # so the decoration keys match downstream atomic comparisons.
 
     # Trim leading preamble rows so the first row is a party label
     def _is_data_party(v: object) -> bool:
@@ -158,15 +181,9 @@ def process_2002_split_sheet_df_to_endstate(
     # count_cols includes Party Vote Totals (counts) + candidate/informal/party-only count columns.
     after_total = [c for c in count_cols if c != party_total_col]
 
-    if candidate_order:
-        cand_n = len(candidate_order)
-        candidate_count_cols = after_total[:cand_n]
-        extra_cols = after_total[cand_n:]
-        rename_map = {candidate_count_cols[i]: candidate_order[i] for i in range(min(len(candidate_count_cols), cand_n))}
-        df = df.rename(columns=rename_map)
-        candidate_cols = candidate_order[: len(candidate_count_cols)] + [str(c) for c in extra_cols]
-    else:
-        candidate_cols = [str(c) for c in after_total]
+    # Keep original column titles in the resulting split vote file.
+    # (Do not rename using candidate_order.)
+    candidate_cols = list(after_total)
 
     # Keep only Party + counts
     keep_cols = ["Party", party_total_col] + candidate_cols
@@ -222,6 +239,20 @@ def process_2002_split_sheet_df_to_endstate(
     df["Party"] = df["Party"].apply(map_party_label)
     df["QA_Total_Party_Votes_from_atomic_party"] = df["Party"].apply(lambda p: float(atomic_party_totals.get(str(p), 0.0)))
 
+    # In the party rows, append the candidate name from the candidate roster so the row
+    # label has the form: "Party Name (Candidate Name)".
+    if party_to_candidate_names:
+        def _decorate_party(p: object) -> object:
+            if pd.isna(p):
+                return p
+            s = str(p).strip()
+            if not s or s.casefold() == "nan":
+                return p
+            cn = party_to_candidate_names.get(s)
+            return f"{s} ({cn})" if cn else s
+
+        df["Party"] = df["Party"].apply(_decorate_party)
+
     # Row sums and consistency
     df["Sum_from_split_vote_counts"] = df[candidate_cols].sum(axis=1)
     # Party Vote Totals column is the authoritative split per-row total.
@@ -261,10 +292,17 @@ def process_2002_split_xls_to_endstate(
     xls_path: Path,
     atomic_party_totals: Dict[str, float],
     candidate_order: Optional[List[str]],
+    party_to_candidate_names: Optional[Dict[str, str]],
     out_csv: Path,
 ) -> None:
     df = read_xls_sheet0(xls_path)
-    process_2002_split_sheet_df_to_endstate(df, atomic_party_totals, candidate_order, out_csv)
+    process_2002_split_sheet_df_to_endstate(
+        df,
+        atomic_party_totals,
+        candidate_order,
+        party_to_candidate_names=party_to_candidate_names,
+        out_csv=out_csv,
+    )
 
 
 def process_split_votes_csv_to_endstate(*args, **kwargs):
