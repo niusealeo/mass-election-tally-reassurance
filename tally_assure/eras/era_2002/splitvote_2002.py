@@ -248,12 +248,9 @@ def process_2002_split_sheet_df_to_endstate(
         except Exception :
             return "error"
 
-            # Per-row consistent flag (string 'error' when not computable):
-            #   Sum_from_split_vote_counts == Total Party Votes == QA_Total_Party_Votes_from_atomic_party
-    df ["consistent"]=[
-    _eq3_or_error (a ,b ,c )
-    for a ,b ,c in zip (df ["Sum_from_split_vote_counts"],df ["Total Party Votes"],df [qa_party_col ])
-    ]
+    # NOTE: We compute row/column consistency internally, but we only *print* the final corner cell.
+    # Keep the "consistent" column present but blank for normal rows; the final "Consistent" row sets the corner.
+    df["consistent"] = ""
 
     # Split out provided totals row if present (by label)
 
@@ -304,6 +301,60 @@ def process_2002_split_sheet_df_to_endstate(
             informal_key =k 
             break 
 
+    def _cand_key(name: str) -> str:
+        """Robust key: SURNAME|first_initial of given (handles Antony vs Tony)."""
+        if name is None:
+            return ""
+        t = str(name).strip()
+        # remove any parenthetical like " (Party)"
+        if "(" in t:
+            t = t.split("(", 1)[0].strip()
+        # collapse whitespace
+        t = " ".join(t.split())
+        if "," in t:
+            surname, rest = t.split(",", 1)
+            given = rest.strip()
+        else:
+            parts = t.split()
+            surname = parts[0] if parts else ""
+            given = parts[1] if len(parts) > 1 else ""
+        fi = given[:1].casefold() if given else ""
+        return f"{surname.strip().casefold()}|{fi}"
+
+    # Build lookup by robust key for candidate totals
+    cand_by_key = {}
+    for k, val in cand_tot.items():
+        kk = _cand_key(k)
+        if kk and kk not in cand_by_key and pd.notna(val):
+            cand_by_key[kk] = val
+
+    def _surname(name: str) -> str:
+        if name is None:
+            return ""
+        t = str(name).strip()
+        if "(" in t:
+            t = t.split("(", 1)[0].strip()
+        t = " ".join(t.split())
+        if "," in t:
+            surname = t.split(",", 1)[0].strip()
+        else:
+            parts = t.split()
+            surname = parts[0].strip() if parts else ""
+        return surname.casefold()
+
+    # Surname-only index (use only if unique to avoid ambiguity)
+    cand_by_surname = {}  # surname -> value, only when unique
+    surname_counts = {}
+    for k, val in cand_tot.items():
+        s = _surname(k)
+        if not s or pd.isna(val):
+            continue
+        surname_counts[s] = surname_counts.get(s, 0) + 1
+        # keep first value; we'll verify uniqueness after
+        if s not in cand_by_surname:
+            cand_by_surname[s] = val
+    # Drop surnames that are not unique
+    cand_by_surname = {s: v for s, v in cand_by_surname.items() if surname_counts.get(s, 0) == 1}
             # Fill candidate columns
     for sc in count_cols :
         if _norm_name (sc ).endswith ("informals")or _norm_name (sc )in {"informals","informal candidate votes"}:
@@ -316,20 +367,26 @@ def process_2002_split_sheet_df_to_endstate(
             qa_row [sc ]=float ("nan")# derived below
             continue 
 
-        cc =split_to_cand .get (sc ,sc )
-        # try exact
-        v =None 
-        for ck in (cc ,str (cc ).strip ()," ".join (str (cc ).split ())):
-            if ck in cand_tot :
-                v =cand_tot [ck ]
-                break 
-        if v is None :
-        # try casefold match
-            for k ,val in cand_tot .items ():
-                if _norm_name (k )==_norm_name (cc ):
-                    v =val 
-                    break 
-        qa_row [sc ]=float (v )if v is not None and pd .notna (v )else float ("nan")
+        cc = split_to_cand.get(sc, sc)
+        v = None
+        # exact / normalized key attempts
+        for ck in (cc, str(cc).strip(), " ".join(str(cc).split())):
+            if ck in cand_tot:
+                v = cand_tot[ck]
+                break
+        if v is None:
+            # casefold match
+            for k, val in cand_tot.items():
+                if _norm_name(k) == _norm_name(cc):
+                    v = val
+                    break
+        if v is None:
+            # robust surname+initial match (handles name variants like Antony vs Tony)
+            v = cand_by_key.get(_cand_key(cc))
+        if v is None:
+            # surname-only unique fallback (handles Tony vs Antony when only one Bunting exists)
+            v = cand_by_surname.get(_surname(cc))
+        qa_row[sc] = float(v) if v is not None and pd.notna(v) else float("nan")
 
         # Compute Party Only for QA row if possible (needs total party votes sum)
     total_party_votes_sum =float (party_meta .get ('total_party_votes_incl_informal')) if party_meta and party_meta.get('total_party_votes_incl_informal') is not None else (float (sum (atomic_party_totals .values ()))if atomic_party_totals else float ('nan'))
@@ -410,50 +467,92 @@ def process_2002_split_sheet_df_to_endstate(
         provided_row_dict =df_provided_totals .iloc [0 ].to_dict ()
         provided_row_dict ["Party"]="Provided candidate split vote totals"
 
-        # Attach row-level consistent values to summary rows
-    sum_row ["consistent"]=_row_consistent_from_dict (sum_row )
-    if provided_row_dict is not None :
-        provided_row_dict ["consistent"]=_row_consistent_from_dict (provided_row_dict )
-    qa_row ["consistent"]=_row_consistent_from_dict (qa_row )
+    # Attach row-level consistent values to each PARTY row (printed in last column).
+    # Summary rows are handled separately below.
+    df_main = df_main.copy()
+    df_main["consistent"] = [
+        _row_consistent_from_dict(r.to_dict()) if isinstance(r, pd.Series) else "error"
+        for _, r in df_main.iterrows()
+    ]
 
-    # Column-wise consistency (last row) for each compare column
-    consistent_row :Dict [str ,object ]={"Party":"Consistent"}
-    col_consistency_values :List [object ]=[]
+    # Build provided totals row dict (if present) but do NOT compute/print a bool for it.
+    provided_row_dict: Optional[dict] = None
+    if not df_provided_totals.empty:
+        provided_row_dict = df_provided_totals.iloc[0].to_dict()
+        provided_row_dict["Party"] = "Provided candidate split vote totals"
 
-    for c in compare_cols :
-        if provided_row_dict is None :
-            v ="error"
-        else :
-            v =_eq_vals ([
-            _float_or_nan (sum_row .get (c )),
-            _float_or_nan (provided_row_dict .get (c )),
-            _float_or_nan (qa_row .get (c )),
+    # Compute row-consistency for summary rows (used for final corner only; not printed).
+    sum_row_cons = _row_consistent_from_dict(sum_row)
+    prov_row_cons = _row_consistent_from_dict(provided_row_dict) if provided_row_dict is not None else "error"
+    qa_row_cons = _row_consistent_from_dict(qa_row)
+
+    # Totals×Totals diagonal block A:
+    # place the grand total (total_party_votes_sum) on the diagonal, leave off-diagonals empty.
+    diag_total = total_party_votes_sum
+    def _blank_totals_block(d: dict, which: str) -> dict:
+        # which in {'sum','provided','qa'} chooses which totals column receives the diagonal value
+        d = dict(d)
+        # empty all three totals columns first
+        d["Sum_from_split_vote_counts"] = ""
+        d["Total Party Votes"] = ""
+        d[qa_party_col] = ""
+        if which == 'sum':
+            d["Sum_from_split_vote_counts"] = diag_total
+        elif which == 'provided':
+            d["Total Party Votes"] = diag_total
+        elif which == 'qa':
+            d[qa_party_col] = diag_total
+        return d
+
+    sum_row = _blank_totals_block(sum_row, 'sum')
+    if provided_row_dict is not None:
+        provided_row_dict = _blank_totals_block(provided_row_dict, 'provided')
+    qa_row = _blank_totals_block(qa_row, 'qa')
+
+    # Do not print bools for totals rows
+    sum_row["consistent"] = ""
+    if provided_row_dict is not None:
+        provided_row_dict["consistent"] = ""
+    qa_row["consistent"] = ""
+
+    # Bool row: per-column equality of the three totals rows for candidate/informal/party-only columns only.
+    bool_row: Dict[str, object] = {"Party": "bool"}
+    col_consistency_values: List[object] = []
+    # Candidate/value columns to check:
+    value_cols = count_cols  # includes Informals/Party Only count columns
+    for c in value_cols:
+        if provided_row_dict is None:
+            v = "error"
+        else:
+            v = _eq_vals([
+                _float_or_nan(sum_row.get(c)),
+                _float_or_nan(provided_row_dict.get(c)),
+                _float_or_nan(qa_row.get(c)),
             ])
-        consistent_row [c ]=v 
-        col_consistency_values .append (v )
+        bool_row[c] = v
+        col_consistency_values.append(v)
 
-        # Final corner cell: AND(all row-level consistent values above, all column-consistency values)
-    row_consistency_values :List [object ]=[]
-    if "consistent"in df_main .columns :
-        row_consistency_values .extend (df_main ["consistent"].tolist ())
-    row_consistency_values .append (sum_row ["consistent"])
-    row_consistency_values .append (provided_row_dict .get ("consistent")if provided_row_dict is not None else "error")
-    row_consistency_values .append (qa_row ["consistent"])
+    # Totals columns are left empty in bool row (diagonal identity requirement)
+    bool_row["Sum_from_split_vote_counts"] = ""
+    bool_row["Total Party Votes"] = ""
+    bool_row[qa_party_col] = ""
 
-    corner =_and_truth (row_consistency_values +col_consistency_values )
-    consistent_row ["consistent"]=corner 
+    # Final corner cell: AND(all party-row bools, and summary-row bools, and all value-column bools)
+    row_consistency_values: List[object] = []
+    row_consistency_values.extend(df_main["consistent"].tolist())
+    row_consistency_values.append(sum_row_cons)
+    row_consistency_values.append(prov_row_cons)
+    row_consistency_values.append(qa_row_cons)
+    corner = _and_truth(row_consistency_values + col_consistency_values)
+    bool_row["consistent"] = corner
 
-    # Assemble final table
-    out_rows :List [pd .DataFrame ]=[df_main ]
-
-    out_rows .append (pd .DataFrame ([sum_row ],columns =["Party"]+count_cols +["Sum_from_split_vote_counts","Total Party Votes",qa_party_col ,"consistent"]))
-
-    if provided_row_dict is not None :
-        out_rows .append (pd .DataFrame ([provided_row_dict ],columns =["Party"]+count_cols +["Sum_from_split_vote_counts","Total Party Votes",qa_party_col ,"consistent"]))
-
-    out_rows .append (pd .DataFrame ([qa_row ],columns =["Party"]+count_cols +["Sum_from_split_vote_counts","Total Party Votes",qa_party_col ,"consistent"]))
-
-    out_rows .append (pd .DataFrame ([consistent_row ],columns =["Party"]+count_cols +["Sum_from_split_vote_counts","Total Party Votes",qa_party_col ,"consistent"]))
+    # Assemble final table in required block layout
+    out_rows: List[pd.DataFrame] = [df_main]
+    out_rows.append(pd.DataFrame([sum_row], columns=["Party"] + count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col, "consistent"]))
+    if provided_row_dict is not None:
+        out_rows.append(pd.DataFrame([provided_row_dict], columns=["Party"] + count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col, "consistent"]))
+    out_rows.append(pd.DataFrame([qa_row], columns=["Party"] + count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col, "consistent"]))
+    out_rows.append(pd.DataFrame([bool_row], columns=["Party"] + count_cols + ["Sum_from_split_vote_counts", "Total Party Votes", qa_party_col, "consistent"]))
 
     out_df =pd .concat (out_rows ,ignore_index =True ,sort =False )
 
