@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -276,20 +278,45 @@ def extract_party_roster(df: pd.DataFrame, totals_idx: Optional[int]) -> pd.Data
 
 
 def port_candidate_roster_csv(candidate_csv: Path, out_csv: Path) -> None:
+    """Emit a candidate roster CSV including party affiliations.
+
+    Names + party affiliations are taken from the roster block after the totals row.
+    Totals carried forward are QA totals computed from polling-place rows (NOT provided totals).
+    """
     df = read_csv_atomic(candidate_csv)
     trow = find_totals_row(df)
     roster = extract_candidate_roster(df, trow)
-    _format_df_numbers_for_csv(roster).to_csv(out_csv, index=False, encoding="utf-8")
 
+    # QA totals from rows, keyed by the main-table candidate column headers
+    qa = _qa_candidate_totals_from_rows(candidate_csv)
+    cand_cols, _, _ = candidate_numeric_cols(df)
+
+    def norm(s: str) -> str:
+        return re.sub(r"\s+", " ", str(s).strip()).casefold()
+
+    header_map = {norm(c): float(qa.get(str(c).strip(), 0.0)) for c in cand_cols}
+
+    if not roster.empty:
+        roster["total_candidate_votes"] = roster["candidate"].apply(lambda x: header_map.get(norm(x), float("nan")))
+    roster = _format_df_numbers_for_csv(roster)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    roster.to_csv(out_csv, index=False, encoding="utf-8")
 
 def port_party_roster_csv(party_csv: Path, out_csv: Path) -> None:
+    """Emit a party roster CSV.
+
+    Party names are taken from the main-table party vote columns.
+    Totals carried forward are QA totals computed from polling-place rows (NOT provided totals).
+    """
     df = read_csv_atomic(party_csv)
-    trow = find_totals_row(df)
-    roster = extract_party_roster(df, trow)
-    _format_df_numbers_for_csv(roster).to_csv(out_csv, index=False, encoding="utf-8")
+    party_cols, _, _ = party_numeric_cols(df)
+    qa = _qa_party_totals_from_rows(party_csv)
 
-
-# ---------------- detailed atomic checksums ----------------
+    rows = [{"party": str(c).strip(), "total_party_votes": float(qa.get(str(c).strip(), 0.0))} for c in party_cols]
+    roster = pd.DataFrame(rows, columns=["party", "total_party_votes"])
+    roster = _format_df_numbers_for_csv(roster)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    roster.to_csv(out_csv, index=False, encoding="utf-8")
 
 def checksum_candidate_atomic_detailed(candidate_csv: Path) -> Dict[str, Any]:
     df = read_csv_atomic(candidate_csv)
@@ -483,7 +510,66 @@ def checksum_party_atomic_detailed(party_csv: Path) -> Dict[str, Any]:
 
 # ---------------- Split-vote endstate checksums (2002) ----------------
 
-def _read_atomic_candidate_totals(candidate_csv: Path) -> Dict[str, float]:
+def _qa_candidate_totals_from_rows(candidate_csv: Path) -> Dict[str, float]:
+    """Compute QA totals by summing polling-place rows (NOT using provided totals row).
+
+    Returns a dict keyed by the candidate column headers in the main table, plus:
+      - informal totals under several common keys
+      - total valid candidate votes (computed)
+    """
+    df = read_csv_atomic(candidate_csv)
+    trow = find_totals_row(df)
+    if trow is None:
+        # best-effort: treat entire df as polling rows
+        trow = df.shape[0]
+    cand_cols, total_valid_col, informal_col = candidate_numeric_cols(df)
+    # Coerce numeric columns on polling rows only
+    poll = df.iloc[:trow].copy()
+    for c in cand_cols + [total_valid_col, informal_col]:
+        if c in poll.columns:
+            poll[c] = _to_num(poll[c])
+    out: Dict[str, float] = {}
+    for c in cand_cols:
+        out[str(c).strip()] = float(poll[c].sum(skipna=True)) if c in poll.columns else 0.0
+    # Informals total
+    informal_total = float(poll[informal_col].sum(skipna=True)) if informal_col in poll.columns else 0.0
+    out[str(informal_col).strip()] = informal_total
+    out["Informals"] = informal_total
+    out["Informal Candidate Votes"] = informal_total
+    # Total valid candidate votes (QA): sum of candidate columns
+    total_valid = float(sum(out[str(c).strip()] for c in cand_cols)) if cand_cols else 0.0
+    out[str(total_valid_col).strip()] = total_valid
+    out["Total valid candidate votes"] = total_valid
+    return out
+
+
+def _qa_party_totals_from_rows(party_csv: Path) -> Dict[str, float]:
+    """Compute QA party totals by summing polling-place rows (NOT using provided totals row)."""
+    df = read_csv_atomic(party_csv)
+    trow = find_totals_row(df)
+    if trow is None:
+        trow = df.shape[0]
+    party_cols, total_valid_col, informal_col = party_numeric_cols(df)
+    poll = df.iloc[:trow].copy()
+    for c in party_cols + [total_valid_col, informal_col]:
+        if c in poll.columns:
+            poll[c] = _to_num(poll[c])
+    out: Dict[str, float] = {}
+    for c in party_cols:
+        out[str(c).strip()] = float(poll[c].sum(skipna=True)) if c in poll.columns else 0.0
+    # Informals totals (party informals) can be useful in diagnostics
+    informal_total = float(poll[informal_col].sum(skipna=True)) if informal_col in poll.columns else 0.0
+    out[str(informal_col).strip()] = informal_total
+    out["Informals"] = informal_total
+    # Total valid party votes (QA): sum of party columns
+    total_valid = float(sum(out[str(c).strip()] for c in party_cols)) if party_cols else 0.0
+    out[str(total_valid_col).strip()] = total_valid
+    out["Total valid party votes"] = total_valid
+    return out
+
+
+def _provided_candidate_totals_from_totals_row(candidate_csv: Path) -> Dict[str, float]:
+    """Read PROVIDED totals from the totals row (for integrity comparison only)."""
     df = read_csv_atomic(candidate_csv)
     trow = find_totals_row(df)
     if trow is None:
@@ -492,28 +578,42 @@ def _read_atomic_candidate_totals(candidate_csv: Path) -> Dict[str, float]:
     for c in cand_cols + [total_valid_col, informal_col]:
         df[c] = _to_num(df[c])
     out = {str(c).strip(): float(df.loc[trow, c]) if pd.notna(df.loc[trow, c]) else 0.0 for c in cand_cols}
-    # Provide informal candidate votes total under common keys so the split QA row can populate Informals.
     informal_total = float(df.loc[trow, informal_col]) if pd.notna(df.loc[trow, informal_col]) else 0.0
     out[str(informal_col).strip()] = informal_total
-    out['Informals'] = informal_total
-    out['Informal Candidate Votes'] = informal_total
-    # Total valid candidate votes can also be useful for diagnostics.
+    out["Informals"] = informal_total
+    out["Informal Candidate Votes"] = informal_total
     total_valid = float(df.loc[trow, total_valid_col]) if pd.notna(df.loc[trow, total_valid_col]) else 0.0
     out[str(total_valid_col).strip()] = total_valid
-    out['Total valid candidate votes'] = total_valid
+    out["Total valid candidate votes"] = total_valid
     return out
 
 
-def _read_atomic_party_totals(party_csv: Path) -> Dict[str, float]:
+def _provided_party_totals_from_totals_row(party_csv: Path) -> Dict[str, float]:
+    """Read PROVIDED totals from the totals row (for integrity comparison only)."""
     df = read_csv_atomic(party_csv)
     trow = find_totals_row(df)
     if trow is None:
         return {}
-    party_cols, _, _ = party_numeric_cols(df)
-    for c in party_cols:
+    party_cols, total_valid_col, informal_col = party_numeric_cols(df)
+    for c in party_cols + [total_valid_col, informal_col]:
         df[c] = _to_num(df[c])
-    return {str(c).strip(): float(df.loc[trow, c]) if pd.notna(df.loc[trow, c]) else 0.0 for c in party_cols}
+    out = {str(c).strip(): float(df.loc[trow, c]) if pd.notna(df.loc[trow, c]) else 0.0 for c in party_cols}
+    informal_total = float(df.loc[trow, informal_col]) if pd.notna(df.loc[trow, informal_col]) else 0.0
+    out[str(informal_col).strip()] = informal_total
+    out["Informals"] = informal_total
+    total_valid = float(df.loc[trow, total_valid_col]) if pd.notna(df.loc[trow, total_valid_col]) else 0.0
+    out[str(total_valid_col).strip()] = total_valid
+    out["Total valid party votes"] = total_valid
+    return out
 
+
+def _read_atomic_candidate_totals(candidate_csv: Path) -> Dict[str, float]:
+    """Return QA totals computed from polling-place rows (NOT the provided totals row)."""
+    return _qa_candidate_totals_from_rows(candidate_csv)
+
+def _read_atomic_party_totals(party_csv: Path) -> Dict[str, float]:
+    """Return QA totals computed from polling-place rows (NOT the provided totals row)."""
+    return _qa_party_totals_from_rows(party_csv)
 
 def checksum_splitvote_endstate_2002(
     split_endstate_csv: Path,

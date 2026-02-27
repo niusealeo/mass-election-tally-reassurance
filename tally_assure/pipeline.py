@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from .libs.paths import common_parent, relativize_detail
+
 from .checksums import (
     now_stamps,
     safe_mkdir,
@@ -25,62 +27,11 @@ from .discovery import ElectorateJob, build_jobs
 from .porting import process_2002_split_xls_to_endstate
 
 
-def _closest_common_ancestor(a: Path, b: Path) -> Path:
-    a = a.resolve()
-    b = b.resolve()
-    ap = a.parts
-    bp = b.parts
-    n = min(len(ap), len(bp))
-    i = 0
-    while i < n and ap[i] == bp[i]:
-        i += 1
-    if i == 0:
-        return Path(a.anchor)
-    return Path(*ap[:i])
 
 
-def _common_parent(paths: List[Optional[Path]]) -> Optional[Path]:
-    ps = [p.resolve() for p in paths if p is not None]
-    if not ps:
-        return None
-    try:
-        return Path(os.path.commonpath([str(p) for p in ps]))
-    except Exception:
-        # fallback: pairwise common ancestor
-        anc = ps[0]
-        for p in ps[1:]:
-            anc = _closest_common_ancestor(anc, p)
-        return anc
 
 
-def _rel_to_common(p: Optional[Path], common: Optional[Path]) -> Optional[str]:
-    if p is None:
-        return None
-    if common is None:
-        return str(p)
-    try:
-        return str(p.resolve().relative_to(common))
-    except Exception:
-        return str(p)
 
-
-def _relativize_detail(detail: Optional[dict], common: Optional[Path]) -> Optional[dict]:
-    if detail is None:
-        return None
-    out = dict(detail)
-    if "file" in out:
-        try:
-            out["file"] = _rel_to_common(Path(out["file"]), common)
-        except Exception:
-            pass
-    # some substructures store absolute 'file' fields too
-    for k in ["candidate", "party", "splitvote"]:
-        if k in out and isinstance(out[k], dict) and "file" in out[k]:
-            try:
-                out[k]["file"] = _rel_to_common(Path(out[k]["file"]), common)
-            except Exception:
-                pass
-    return out
 
 
 def _load_alphabetic_numbers(electorates_by_term_path: Path) -> Dict[str, Dict[str, int]]:
@@ -240,7 +191,7 @@ def run_all(
         split_endstate_path = None
         split_detail = None
         if job.year == 2002 and job.split_path and job.split_path.exists() and job.party_path and job.party_path.exists():
-            split_endstate_path = out_elec / f"{job.electorateFolder}_split_votes_endstate.csv"
+            split_endstate_path = out_elec / f"{job.electorateFolder}_twintick_approvalballot_solution.csv"
             atomic_party_totals = _read_atomic_party_totals(job.party_path)
             candidate_order = None
             atomic_cand_totals = None
@@ -248,6 +199,24 @@ def run_all(
                 # Use the atomic candidate totals columns (ordered) to label split columns.
                 atomic_cand_totals = _read_atomic_candidate_totals(job.cand_path)
                 candidate_order = [k for k in atomic_cand_totals.keys() if str(k).strip()]
+
+                # Prefer candidate totals from the candidate roster (for QA row), if available.
+                # These totals are the ones we emit in the candidate roster CSV and must be used consistently.
+                try:
+                    cand_roster_path_for_totals = out_elec / f"{job.electorateFolder}_candidate_roster.csv"
+                    if cand_roster_path_for_totals.exists():
+                        rdf_tot = pd.read_csv(cand_roster_path_for_totals, encoding="utf-8")
+                        if "candidate" in rdf_tot.columns and "total_candidate_votes" in rdf_tot.columns:
+                            roster_totals = {
+                                str(r["candidate"]).strip(): float(r["total_candidate_votes"])
+                                for _, r in rdf_tot.iterrows()
+                                if str(r.get("candidate", "")).strip()
+                            }
+                            # overlay roster totals for candidate columns, keep Informals/Total Valid from totals-row dict
+                            for k, v in roster_totals.items():
+                                atomic_cand_totals[k] = float(v)
+                except Exception:
+                    pass
             # Build party->candidate mapping for row label decoration in split endstate.
             party_to_candidate_names = None
             cand_roster_path = out_elec / f"{job.electorateFolder}_candidate_roster.csv"
@@ -275,7 +244,7 @@ def run_all(
             split_detail = checksum_splitvote_endstate_2002(split_endstate_path, job.cand_path, job.party_path)
 
         # Write per-electorate checksum jsons
-        common_parent = _common_parent([job.split_path, job.cand_path, job.party_path, split_endstate_path, out_elec])
+        common_parent = common_parent([job.split_path, job.cand_path, job.party_path, split_endstate_path, out_elec])
         elec_meta = {
             "termKey": termKey,
             "year": job.year,
@@ -314,9 +283,9 @@ def run_all(
             out_pass = out_elec / f"{job.electorateFolder}_checksum_pass_{stamp}.json"
             pass_payload = {
                 **elec_meta,
-                "candidate": _prune_detail(cand_detail, "passed"),
-                "party": _prune_detail(party_detail, "passed"),
-                "splitvote": _prune_detail(split_detail, "passed"),
+                "candidate": _prune_detail(relativize_detail(cand_detail, common_parent), "passed"),
+                "party": _prune_detail(relativize_detail(party_detail, common_parent), "passed"),
+                "splitvote": _prune_detail(relativize_detail(split_detail, common_parent), "passed"),
             }
             write_json(out_pass, pass_payload)
 
@@ -324,9 +293,9 @@ def run_all(
             out_fail = out_elec / f"{job.electorateFolder}_checksum_fail_{stamp}.json"
             fail_payload = {
                 **elec_meta,
-                "candidate": _prune_detail(cand_detail, "failed"),
-                "party": _prune_detail(party_detail, "failed"),
-                "splitvote": _prune_detail(split_detail, "failed"),
+                "candidate": _prune_detail(relativize_detail(cand_detail, common_parent), "failed"),
+                "party": _prune_detail(relativize_detail(party_detail, common_parent), "failed"),
+                "splitvote": _prune_detail(relativize_detail(split_detail, common_parent), "failed"),
             }
             write_json(out_fail, fail_payload)
             term_fail.setdefault(termKey, []).append({"electorateFolder": job.electorateFolder, "alphabeticNumber": job.alphabeticNumber})

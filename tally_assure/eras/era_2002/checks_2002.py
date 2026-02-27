@@ -28,10 +28,16 @@ def checksum_splitvote_endstate_2002(
     candidate_csv: Path,
     party_csv: Path,
 ) -> Dict[str, Any]:
-    """Checks the endstate splitvote matrix against row/col totals and atomic totals (2002-era)."""
+    """Checks the 2002-era approval-ballot solution matrix against atomic candidate/party totals."""
     mat = pd.read_csv(split_endstate_csv)
 
-    required = {"Party", "Sum_from_split_vote_counts", "Total Party Votes", "QA_Total_Party_Votes_from_atomic_party", "consistent"}
+    required = {
+        "Party",
+        "Sum_from_split_vote_counts",
+        "Total Party Votes",
+        "QA_Total_Party_Votes_from_atomic_party",
+        "consistent",
+    }
     if not required.issubset(set(mat.columns)):
         return {
             "file": str(split_endstate_csv),
@@ -39,26 +45,31 @@ def checksum_splitvote_endstate_2002(
             "checks": {},
         }
 
-    # Separate main rows from bottom summary rows
     def is_summary_party(p: str) -> bool:
         p = str(p).strip().lower()
         return p in {
             "sum_from_split_vote_counts",
-            "party vote totals",
+            "party vote totals",  # legacy name
+            "provided candidate split vote totals",
             "qa sums from the candidate csv",
             "consistent",
         }
 
     main = mat[~mat["Party"].astype(str).apply(is_summary_party)].copy()
 
-    bookkeeping = ["Sum_from_split_vote_counts", "Total Party Votes", "QA_Total_Party_Votes_from_atomic_party", "consistent"]
+    bookkeeping = [
+        "Sum_from_split_vote_counts",
+        "Total Party Votes",
+        "QA_Total_Party_Votes_from_atomic_party",
+        "consistent",
+    ]
     count_cols = [c for c in mat.columns if c not in ["Party"] + bookkeeping]
 
-    # numeric conversion
-    for c in count_cols + bookkeeping[:2]:
+    # numeric conversion for main rows
+    for c in count_cols + ["Sum_from_split_vote_counts", "Total Party Votes"]:
         main.loc[:, c] = pd.to_numeric(main[c], errors="coerce").fillna(0.0)
 
-    # Row consistency: provided Total Party Votes vs QA sum of row counts
+    # Row check: sum of row counts == provided Total Party Votes
     row_fail = []
     row_pass = []
     for _, r in main.iterrows():
@@ -68,23 +79,16 @@ def checksum_splitvote_endstate_2002(
         if qa_sum == provided_total:
             row_pass.append({"party": party})
         else:
-            row_fail.append(
-                {
-                    "party": party,
-                    **_fail_provided_vs_qa("Total Party Votes", provided_total, qa_sum),
-                }
-            )
+            row_fail.append({"party": party, **_fail_provided_vs_qa("Total Party Votes", provided_total, qa_sum)})
 
-    # Column sums (from split = provided) vs atomic candidate totals (QA)
+    # Column check: sum of column counts across parties == atomic candidate totals (from candidate CSV totals row)
     atomic_cands = _read_atomic_candidate_totals(candidate_csv)
     col_fail = []
     col_pass = []
     for c in count_cols:
-        # strip party parenthetical to match atomic candidate headers
-        base = str(c)
-        base2 = base.rsplit("(", 1)[0].strip() if "(" in base and base.rstrip().endswith(")") else base.strip()
-        # special casing for Informals
-        lookup_keys = [base.strip(), base2.strip(), " ".join(base2.split())]
+        base = str(c).strip()
+        base2 = base.rsplit("(", 1)[0].strip() if "(" in base and base.endswith(")") else base
+        lookup_keys = [base, base2, " ".join(base2.split())]
         official_key = next((k for k in lookup_keys if k in atomic_cands), None)
         if official_key is None:
             continue
@@ -95,28 +99,7 @@ def checksum_splitvote_endstate_2002(
         else:
             col_fail.append(_fail_provided_vs_qa(str(c), provided, qa))
 
-    
-    # Total Party Votes per row vs QA atomic party totals column (when present)
-    provided_vs_qa_party_fail = []
-    provided_vs_qa_party_pass = []
-    for _, r in main.iterrows():
-        party = str(r["Party"]).strip()
-        provided_total = float(r["Total Party Votes"])
-        qa_total = float(r.get("QA_Total_Party_Votes_from_atomic_party", 0.0))
-        # if QA column is missing/zero because it was NaN in CSV, skip
-        if pd.isna(r.get("QA_Total_Party_Votes_from_atomic_party")):
-            continue
-        if provided_total == qa_total:
-            provided_vs_qa_party_pass.append({"party": party})
-        else:
-            provided_vs_qa_party_fail.append(
-                {
-                    "party": party,
-                    **_fail_provided_vs_qa("QA_Total_Party_Votes_from_atomic_party", provided_total, qa_total),
-                }
-            )
-
-# Party totals per row (split provided) vs atomic party totals (QA)
+    # Party totals per row vs atomic party totals (from party CSV totals row)
     atomic_party = _read_atomic_party_totals(party_csv)
     party_fail = []
     party_pass = []
@@ -132,12 +115,13 @@ def checksum_splitvote_endstate_2002(
         else:
             party_fail.append(_fail_provided_vs_qa(party, provided, qa))
 
+    # Provided totals row vs sum row (elementwise)
     def find_row(label: str) -> Optional[pd.Series]:
         hit = mat[mat["Party"].astype(str).str.strip().str.lower() == label.lower()]
         return hit.iloc[0] if len(hit) else None
 
     sum_row = find_row("Sum_from_split_vote_counts")
-    prov_row = find_row("Party vote totals")
+    prov_row = find_row("Provided candidate split vote totals") or find_row("Party vote totals")
     totals_row_fail = []
     totals_row_pass = []
     if sum_row is not None and prov_row is not None:
@@ -148,33 +132,32 @@ def checksum_splitvote_endstate_2002(
                 totals_row_pass.append({"key": c})
             else:
                 totals_row_fail.append(_fail_provided_vs_qa(c, provided, qa))
+    else:
+        totals_row_fail.append({"key": "provided_totals_row_missing_or_sum_row_missing"})
 
-    # Final Consistent row (bool) must be included in pass/fail output.
+    # Corner cell check (Consistent row × consistent column) must be string 'true'/'false'/'error'
     consistent_row = find_row("Consistent")
     consistent_checks_pass = []
     consistent_checks_fail = []
     if consistent_row is None:
-        consistent_checks_fail.append({"key": "Consistent", "value": False, "reason": "row missing"})
+        consistent_checks_fail.append({"key": "corner", "value": "error", "reason": "Consistent row missing"})
     else:
-        val = consistent_row.get("consistent") if isinstance(consistent_row, pd.Series) else None
-    # The corner cell must be exactly True to pass. If not computable it should be "error" and fail.
-    if val is True or (isinstance(val, str) and val.strip().casefold() == "true"):
-        consistent_checks_pass.append({"key": "Consistent", "value": True})
-    else:
-        reason = None
-        if isinstance(val, str) and val.strip().casefold() == "error":
-            reason = "unable to compute corner cell"
-        consistent_checks_fail.append({"key": "Consistent", "value": False, **({"reason": reason} if reason else {})})
+        val = consistent_row.get("consistent")
+        sval = str(val).strip().casefold() if val is not None else "error"
+        if sval == "true":
+            consistent_checks_pass.append({"key": "corner", "value": "true"})
+        elif sval == "false":
+            consistent_checks_fail.append({"key": "corner", "value": "false"})
+        else:
+            consistent_checks_fail.append({"key": "corner", "value": "error", "reason": "unable to compute corner cell"})
 
-
-        return {
-            "file": str(split_endstate_csv),
-            "checks": {
-                "splitvote_row_consistency_bool": {"passed": row_pass, "failed": row_fail},
-                "splitvote_candidate_column_sums_vs_atomic_candidate_totals": {"passed": col_pass, "failed": col_fail},
-                "splitvote_party_totals_vs_atomic_party_totals": {"passed": party_pass, "failed": party_fail},
-                "splitvote_total_party_votes_vs_qa_atomic_party_totals": {"passed": provided_vs_qa_party_pass, "failed": provided_vs_qa_party_fail},
-                "splitvote_provided_totals_row_vs_sum_of_rows": {"passed": totals_row_pass, "failed": totals_row_fail},
-                "splitvote_endstate_consistent_row": {"passed": consistent_checks_pass, "failed": consistent_checks_fail},
-            },
-        }
+    return {
+        "file": str(split_endstate_csv),
+        "checks": {
+            "splitvote_row_consistency_bool": {"passed": row_pass, "failed": row_fail},
+            "splitvote_candidate_column_sums_vs_atomic_candidate_totals": {"passed": col_pass, "failed": col_fail},
+            "splitvote_party_totals_vs_atomic_party_totals": {"passed": party_pass, "failed": party_fail},
+            "splitvote_provided_totals_row_vs_sum_of_rows": {"passed": totals_row_pass, "failed": totals_row_fail},
+            "splitvote_endstate_consistent_row": {"passed": consistent_checks_pass, "failed": consistent_checks_fail},
+        },
+    }

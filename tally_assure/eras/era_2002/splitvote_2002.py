@@ -203,7 +203,7 @@ def process_2002_split_sheet_df_to_endstate(
         decorated = []
         for p in df["Party"].tolist():
             p_txt = "" if pd.isna(p) else str(p).strip()
-            if p_txt.casefold() in {"party vote totals"}:
+            if p_txt.casefold() in {"party vote totals", "provided candidate split vote totals"}:
                 decorated.append(p_txt)
                 continue
             atomic_key = map_party_label(p_txt)
@@ -230,7 +230,7 @@ def process_2002_split_sheet_df_to_endstate(
         if p_norm in {"informal votes", ""}:
             qa_vals.append(float("nan"))
             continue
-        if p_norm == "party vote totals":
+        if p_norm in {"party vote totals", "provided candidate split vote totals"}:
             qa_vals.append(float(sum(atomic_party_totals.values())) if atomic_party_totals else float("nan"))
             continue
         atomic_key = map_party_label(p_base)
@@ -238,12 +238,12 @@ def process_2002_split_sheet_df_to_endstate(
         qa_vals.append(float(v) if v is not None else float("nan"))
     df[qa_party_col] = qa_vals
 
-    def _eq3_or_error(a: float, b: float, c: float) -> object:
-        """Return True/False if comparable, else 'error'."""
+    def _eq3_or_error(a: float, b: float, c: float) -> str:
+        """Return 'true'/'false' if comparable, else 'error'."""
         if pd.isna(a) or pd.isna(b) or pd.isna(c):
             return "error"
         try:
-            return bool(float(a) == float(b) == float(c))
+            return "true" if (float(a) == float(b) == float(c)) else "false"
         except Exception:
             return "error"
 
@@ -257,7 +257,7 @@ def process_2002_split_sheet_df_to_endstate(
     # Split out provided totals row if present (by label)
 
     party_norm = df["Party"].astype(str).str.strip()
-    is_totals_row = party_norm.str.casefold() == "party vote totals"
+    is_totals_row = party_norm.str.casefold().isin(["party vote totals", "provided candidate split vote totals"])
     df_main = df.loc[~is_totals_row].copy()
     df_provided_totals = df.loc[is_totals_row].copy()
 
@@ -379,23 +379,23 @@ def process_2002_split_sheet_df_to_endstate(
         except Exception:
             return float("nan")
 
-    def _eq_vals(vals: List[float]) -> object:
+    def _eq_vals(vals: List[float]) -> str:
         if any(pd.isna(v) for v in vals):
             return "error"
         try:
             first = float(vals[0])
-            return bool(all(float(v) == first for v in vals[1:]))
+            return "true" if all(float(v) == first for v in vals[1:]) else "false"
         except Exception:
             return "error"
 
-    def _and_truth(values: List[object]) -> object:
-        # Three-valued AND over True/False/"error"
-        has_error = any((v == "error") or pd.isna(v) for v in values)
-        if has_error:
+    def _and_truth(values: List[object]) -> str:
+        # Three-valued AND over 'true'/'false'/'error'
+        vals = [("error" if (v == "error" or pd.isna(v)) else (str(v).strip().casefold() if isinstance(v, str) else ("true" if v is True else "false" if v is False else "error"))) for v in values]
+        if any(v == "error" for v in vals):
             return "error"
-        if any(v is False for v in values):
-            return False
-        return True
+        if any(v == "false" for v in vals):
+            return "false"
+        return "true"
 
     def _row_consistent_from_dict(d: dict) -> object:
         a = _float_or_nan(d.get("Sum_from_split_vote_counts"))
@@ -407,6 +407,7 @@ def process_2002_split_sheet_df_to_endstate(
     provided_row_dict: Optional[dict] = None
     if not df_provided_totals.empty:
         provided_row_dict = df_provided_totals.iloc[0].to_dict()
+        provided_row_dict["Party"] = "Provided candidate split vote totals"
 
     # Attach row-level consistent values to summary rows
     sum_row["consistent"] = _row_consistent_from_dict(sum_row)

@@ -1,1 +1,1 @@
-__all__ = ["discovery","checksums","sainte_lague","sliding_puzzle","porting","pipeline"]
+__all__ = ["discovery","core","eras","libs","checksums","porting","pipeline"]
